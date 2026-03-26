@@ -4,6 +4,8 @@
 #include "robustOptimizer.h"
 #include "co_lrio/srv/save_files.hpp"
 #include <rclcpp/serialization.hpp>
+// #include <sys/stat.h>  // for mkdir
+
 
 namespace co_lrio
 {
@@ -82,9 +84,9 @@ public:
         this->get_parameter("simulator_mode", params.simulator_mode_);
 
         // save file directory
-        this->declare_parameter("save_directory", "/co_lrio_output");
+        this->declare_parameter("save_directory", "/root/cslam_ws/src/Co-LRIO/co_lrio_output");
         this->get_parameter("save_directory", params.save_directory_);
-        params.save_directory_ = std::getenv("HOME") + params.save_directory_;
+        
 
         // set logger level
         this->declare_parameter("loop_log_level", 20);
@@ -114,6 +116,18 @@ public:
         this->get_parameter("odometry_frame", params.odometry_frame_);
         this->declare_parameter("world_frame", "/world");
         this->get_parameter("world_frame", params.world_frame_);
+
+        // Optional manual robot initial poses in the shared world frame:
+        // [x, y, z, roll, pitch, yaw]
+        std::vector<double> manual_init_robot_0;
+        std::vector<double> manual_init_robot_1;
+        std::vector<double> manual_init_robot_2;
+        this->declare_parameter("manual_init_robot_0", std::vector<double>{});
+        this->get_parameter("manual_init_robot_0", manual_init_robot_0);
+        this->declare_parameter("manual_init_robot_1", std::vector<double>{});
+        this->get_parameter("manual_init_robot_1", manual_init_robot_1);
+        this->declare_parameter("manual_init_robot_2", std::vector<double>{});
+        this->get_parameter("manual_init_robot_2", manual_init_robot_2);
 
         // LiDAR setting
         string sensor_type;
@@ -281,6 +295,36 @@ public:
             params.save_directory_, params.enable_ranging_, params.minimum_ranging_,
             params.enable_ranging_outlier_threshold_, params.ranging_outlier_threshold_,
             params.gps_cov_threshold_, params.use_gps_elevation_));
+
+        auto register_manual_pose = [this](RobustOptimizer* optimizer_ptr, const int8_t robot_id, const std::vector<double>& pose_vec)
+        {
+            if (pose_vec.empty())
+            {
+                return;
+            }
+            if (pose_vec.size() != 6)
+            {
+                RCLCPP_WARN(
+                    rclcpp::get_logger(""),
+                    "manual_init_robot_%d must have 6 values [x, y, z, roll, pitch, yaw], got %zu.",
+                    robot_id,
+                    pose_vec.size());
+                return;
+            }
+
+            gtsam::Pose3 pose(
+                gtsam::Rot3::RzRyRx(pose_vec[3], pose_vec[4], pose_vec[5]),
+                gtsam::Point3(pose_vec[0], pose_vec[1], pose_vec[2]));
+            optimizer_ptr->setManualInitialPose(robot_id, pose);
+            RCLCPP_INFO(
+                rclcpp::get_logger("optimization_log_mini"),
+                "\033[0;36mregister manual prior for robot %d: [%.3f %.3f %.3f %.3f %.3f %.3f]\033[0m",
+                robot_id,
+                pose_vec[0], pose_vec[1], pose_vec[2], pose_vec[3], pose_vec[4], pose_vec[5]);
+        };
+        register_manual_pose(optimizer.get(), 0, manual_init_robot_0);
+        register_manual_pose(optimizer.get(), 1, manual_init_robot_1);
+        register_manual_pose(optimizer.get(), 2, manual_init_robot_2);
 
         // global map visualization
         downsample_filter_for_global_map.setLeafSize(params.map_leaf_size_, params.map_leaf_size_, params.map_leaf_size_);
@@ -858,7 +902,10 @@ public:
                 try
                 {
                     tf2::fromMsg(tf_buffer->lookupTransform(
-                        "robot_" + to_string(robot) + "/odom", "robot_" + to_string(robot) + "/base_link", rclcpp::Time(0)), trans_lidar_2_base);
+                        // "robot_" + to_string(robot) + "/odom", "robot_" + to_string(robot) + "/base_link", rclcpp::Time(0)), trans_lidar_2_base);
+                        "robot_" + to_string(robot) + params.odometry_frame_,
+                        "robot_" + to_string(robot) + "/base_link",
+                        rclcpp::Time(0)), trans_lidar_2_base);
                 }
                 catch (tf2::TransformException ex)
                 {
@@ -868,6 +915,10 @@ public:
                 quat_tf.setRPY(relative_trans.rotation().roll(), relative_trans.rotation().pitch(), relative_trans.rotation().yaw());
                 tf2::Transform t_world_to_odom = tf2::Transform(quat_tf, tf2::Vector3(relative_trans.translation().x(), relative_trans.translation().y(), relative_trans.translation().z()));
                 tf2::Stamped<tf2::Transform> temp_trans(t_world_to_odom, trans_lidar_2_base.stamp_, params.world_frame_);
+                // tf2::Stamped<tf2::Transform> temp_trans(
+                //     t_world_to_odom,
+                //     tf2_ros::fromMsg(this->get_clock()->now()),
+                //     params.world_frame_);
                 geometry_msgs::msg::TransformStamped trans_world_to_odom;
                 tf2::convert(temp_trans, trans_world_to_odom);
                 trans_world_to_odom.child_frame_id = "robot_" + to_string(robot) + params.odometry_frame_;
@@ -904,6 +955,12 @@ public:
         else
         {
             directory = std::getenv("HOME") + req->destination;
+            // const char* home_env = std::getenv("HOME");
+            // if (home_env) {
+            //     directory = std::string(home_env) + req->destination;
+            // } else {
+            //     directory = "/root" + req->destination;
+            // }
         }
         RCLCPP_INFO(rclcpp::get_logger(""), "Save directory: %s", directory.c_str());
 

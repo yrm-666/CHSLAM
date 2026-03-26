@@ -1,10 +1,10 @@
 co_lrio:
   # Topics
-  pointCloudTopic: "velodyne_points"               # Point cloud data
-  imuTopic: "imu/data"                         # IMU data
-  odomTopic: "odometry/imu"                   # IMU pre-preintegration odometry, same frequency as IMU
+  pointCloudTopic: "/Carol/velodyne_points"               # Point cloud data
+  imuTopic: "/Carol/imu/data"                         # IMU data
+  odomTopic: "/Carol/correct_imu"                   # IMU pre-preintegration odometry, same frequency as IMU
 
-  # Frames
+  # Framesg
   lidarFrame: "base_link"
   baselinkFrame: "base_link"
   odometryFrame: "odom"

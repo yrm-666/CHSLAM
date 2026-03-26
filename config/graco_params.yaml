@@ -1,0 +1,166 @@
+/**:
+  ros__parameters:
+    use_sim_time: true    #仿真时间
+
+    # simulator mode
+    simulator_mode: false
+
+    # save file directory
+    save_directory: "/root/cslam_ws/src/Co-LRIO/co_lrio_output"
+
+    # The unset/debug/info/warn/error/fatal log level = 0/10/20/30/40/50
+    loop_log_level: 30
+    loop_log_mini_level: 20
+    optimization_log_level: 30
+    optimization_log_mini_level: 20
+    uwb_log_level: 30
+    pcm_log_level: 30
+    map_log_mini_level: 30
+
+    # frames  坐标系
+    lidar_frame: "/lidar_link"
+    baselink_frame: "/base_link"
+    odometry_frame: "/odom"
+    world_frame: "/world"
+
+    # LiDAR setting    激光雷达参数
+    sensor: VLP-16                  #雷达类型
+    scan_topic: "/velodyne/points"         #点云话题
+    n_scan: 16                #线数
+    horizon_scan: 1800          #水平分辨率  每圈点数
+    downsample_rate: 1              #点云降采样率
+    lidar_min_range: 1.0          #激光雷达最小测距范围
+    lidar_max_range: 1000.0       #激光雷达最大测距范围
+
+    # GPS Setting
+    use_gnss: false         #是否使用普通GPS
+    use_rtk: false           #是否使用RTK  （高精度GPS）  
+    gps_cov_threshold: 0.3      
+    use_gps_elevation: true     #是否使用GPS高度信息
+  
+    # feature threshold
+    extract_feature: false     #是否提取边缘/平面特征
+    edge_threshold: 1.0
+    surf_threshold: 0.1
+
+    # keyframe 
+    keyframe_add_dist_threshold: 1.0
+    keyframe_add_angle_threshold: 0.2
+
+    # local map   #局部地图参数
+    use_ikd_tree: false
+    keyframes_density: 3.0 
+    keyframes_search_radius: 30.0
+
+    # odometry gicp setting  GICP核心参数
+    leaf_size: 0.4   #降采样
+    epsilon: 0.005
+    max_iteration_time: 64
+    max_correspondence_distance: 5.0
+    ransac_outlier_reject_threshold: 1.0
+    ransac_iterations_time: 5
+
+    # loop detection setting
+    descriptor_type: "ScanContext"
+    distance_threshold: 0.25 # 0.45
+    candidates_num: 20            
+    # descriptor_type: "LidarIris"
+    # distance_threshold: 0.35 # 0.5
+    # candidates_num: 20
+    max_radius: 80.0
+    exclude_recent_num: 200
+    history_keyframe_search_num: 25
+    fitness_score_threshold: 0.2
+    intra_icp_max_correspondence_distance: 30.0
+    intra_icp_iterations_time: 60
+    inter_icp_max_correspondence_distance: 10.0
+    inter_icp_iterations_time: 200
+
+    # cpu setting
+    number_of_cores: 2
+    loop_detection_interval: 0.01
+
+co_lrio_concentrated_mapping:   #多机器人地图融合模块
+  ros__parameters:
+    # loop detection setting           #开启回环
+    enable_loop: true          
+    map_leaf_size: 0.4
+
+    # pcm configuration           #一致性检测 
+    loop_num_threshold: 1
+    use_pcm: true
+    pcm_threshold: 1.635 # 0.872, 1.635, 2.204, 3.455, 5.348, 7.840
+
+    # uwb configuration                   #开启UWB测距 没有关掉 
+    enable_ranging: true
+    enable_ranging_outlier_threshold: true
+    ranging_outlier_threshold: 0.05 # 0.1, 0.2
+    minimum_ranging: 0.4
+    uwb_distance_thereshold_for_loop: 0.01
+
+    # optimization setting             
+    enable_risam: false
+    use_global_near_map: false
+    global_near_map: 10.0
+
+    # cpu setting
+    parallel_cpu_core: 2
+    pub_tf_interval: 0.01
+    pub_global_map_interval: 20.0
+    global_map_visualization_radius: 100.0
+
+robot_2:
+  co_lrio_lidar_odometry:
+    ros__parameters:
+      # IMU Settings
+      imu_topic: "/Carol//gnss/imu"                 #IMU话题
+      scan_topic: "/Carol/velodyne_points"        #点云话题
+
+      # IMU noise parameters  IMU噪声参数
+      imu_acc_noise: 1.0028108e-02 
+      imu_gyr_noise: 8.3723892e-04
+      imu_acc_bias_noise: 5.5367077e-04 
+      imu_gyr_bias_noise: 1.5212086e-05 
+      imu_gravity: 9.79172227     #重力加速度，不变
+
+      # Extrinsics: T_lb (lidar -> imu) ***********
+      extrinsic_l2i: [ 0.99991642,  0.01018984,  0.00795779, -0.01192777,
+                      -0.01025064,  0.99991829,  0.0076374 , -0.01973063,
+                      -0.00787932, -0.00771833,  0.99993917,  0.12260907,
+                      0.        ,  0.        ,  0.        ,  1.        ]
+
+robot_1:
+  co_lrio_lidar_odometry:
+    ros__parameters:
+      # IMU Settings
+      imu_topic: "/Bob//gnss/imu"
+      scan_topic: "/Bob/velodyne_points" 
+      imu_acc_noise: 1.0028108e-02
+      imu_gyr_noise: 8.3723892e-04
+      imu_acc_bias_noise:  5.5367077e-04 
+      imu_gyr_bias_noise: 1.5212086e-05 
+      imu_gravity: 9.79172227
+
+      # Extrinsics: T_lb (lidar -> imu)
+      extrinsic_l2i: [ 0.99991642,  0.01018984,  0.00795779, -0.01192777,
+                       -0.01025064,  0.99991829,  0.0076374 , -0.01973063,
+                       -0.00787932, -0.00771833,  0.99993917,  0.12260907,
+                        0.        ,  0.        ,  0.        ,  1.        ]
+
+robot_0:
+  co_lrio_lidar_odometry:
+    ros__parameters:
+      # IMU Settings
+      imu_topic: "/Alpha/gnss/imu"
+      scan_topic: "/Alpha/velodyne_points" 
+      imu_acc_noise: 1.0028108e-02
+      imu_gyr_noise: 8.3723892e-04
+      imu_acc_bias_noise:  5.5367077e-04 
+      imu_gyr_bias_noise: 1.5212086e-05 
+      imu_gravity: 9.79172227
+
+      # Extrinsics: T_lb (lidar -> imu)
+      extrinsic_l2i: [ 0.99991642,  0.01018984,  0.00795779, -0.01192777,
+                       -0.01025064,  0.99991829,  0.0076374 , -0.01973063,
+                       -0.00787932, -0.00771833,  0.99993917,  0.12260907,
+                        0.        ,  0.        ,  0.        ,  1.        ]      

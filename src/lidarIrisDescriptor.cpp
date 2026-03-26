@@ -40,6 +40,13 @@ lidarIrisDescriptor::lidarIrisDescriptor(
 	if(directory != "")
 	{
 		iris_file_directory_ = std::getenv("HOME") + save_directory_ + "/irisLoop.txt";
+		// const char* home_env = std::getenv("HOME");
+		// if (home_env) {
+		// 	iris_file_directory_ = std::string(home_env) + save_directory_ + "/irisLoop.txt";
+		// } else {
+		// 	iris_file_directory_ = "/root" + save_directory_ + "/irisLoop.txt";
+		// }
+
 		iris_file.open(directory);
 		iris_file.setf(ios::fixed);
 		iris_file.precision(10);

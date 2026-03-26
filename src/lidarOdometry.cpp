@@ -126,9 +126,17 @@ public:
         this->get_parameter("simulator_mode", params.simulator_mode_);
 
         // save file directory
-        this->declare_parameter("save_directory", "/co_lrio_output");
+        this->declare_parameter("save_directory", "/root/cslam_ws/src/Co-LRIO/co_lrio_output");
         this->get_parameter("save_directory", params.save_directory_);
-        params.save_directory_ = std::getenv("HOME") + params.save_directory_;
+
+        // const char* home_env = std::getenv("HOME");
+        // if (home_env) {
+        //     params.save_directory_ = std::string(home_env) + params.save_directory_;
+        // } else {
+        //     // 如果没有HOME环境变量，使用默认路径
+        //     params.save_directory_ = "/root/co_lrio_output";
+        // }
+        // params.save_directory_ = std::getenv("HOME") + params.save_directory_;
 
         // odometry mode
         this->declare_parameter("only_odom", false);
@@ -925,7 +933,8 @@ public:
             {
                 RCLCPP_ERROR(rclcpp::get_logger(""), "%s", ex.what());
             }
-            tf2::Stamped<tf2::Transform> temp_trans(trans_odom_to_lidar*trans_lidar_2_base, tf2_ros::fromMsg(msg->header.stamp), params.name_ + params.odometry_frame_);
+            // tf2::Stamped<tf2::Transform> temp_trans(trans_odom_to_lidar*trans_lidar_2_base, tf2_ros::fromMsg(msg->header.stamp), params.name_ + params.odometry_frame_);
+            tf2::Stamped<tf2::Transform> temp_trans(trans_odom_to_lidar*trans_lidar_2_base, tf2_ros::fromMsg(this->get_clock()->now()), params.name_ + params.odometry_frame_);
             geometry_msgs::msg::TransformStamped trans_odom_to_base_msg;
             tf2::convert(temp_trans, trans_odom_to_base_msg);
             trans_odom_to_base_msg.child_frame_id = params.name_ + params.baselink_frame_;

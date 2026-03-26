@@ -54,6 +54,7 @@ private:
 
     int prior_owner;
     std::unordered_map<int, gtsam::Pose3> prior_pose;
+    std::unordered_map<int, gtsam::Pose3> manual_prior_pose;
 
     std::shared_ptr<GeographicLib::LocalCartesian> local_cartesian;
     std::unordered_map<int, deque<pair<gtsam::Symbol,nav_msgs::msg::Odometry>>> gps_odoms;
@@ -171,6 +172,13 @@ public:
     ~RobustOptimizer()
     {
         
+    }
+
+    void setManualInitialPose(
+        const int8_t& robot_id,
+        const gtsam::Pose3& pose)
+    {
+        manual_prior_pose[robot_id] = pose;
     }
 
     void addRobot(
@@ -558,11 +566,40 @@ private:
             // prior factor
             if (sf.index_to.index() == 0 && sf.index_from.index() == 0)
             {
-                prior_pose.emplace(make_pair(sf.robot_id, sf.pose_to));
+                // prior_pose.emplace(make_pair(sf.robot_id, sf.pose_to));
+                auto initial_pose = sf.pose_to;
+                if (manual_prior_pose.find(sf.robot_id) != manual_prior_pose.end())
+                {
+                    initial_pose = manual_prior_pose.at(sf.robot_id);
+                }
+                prior_pose.emplace(make_pair(sf.robot_id, initial_pose));
 
                 // initial estimate
-                local_initial_estimate.at(sf.robot_id)->insert(sf.index_to, sf.pose_to);
-                local_initial_estimate_backup.at(sf.robot_id)->insert(sf.index_to, sf.pose_to);
+                // local_initial_estimate.at(sf.robot_id)->insert(sf.index_to, sf.pose_to);
+                // local_initial_estimate_backup.at(sf.robot_id)->insert(sf.index_to, sf.pose_to);
+                local_initial_estimate.at(sf.robot_id)->insert(sf.index_to, initial_pose);
+                local_initial_estimate_backup.at(sf.robot_id)->insert(sf.index_to, initial_pose);
+
+                // Allow a robot to join the shared world frame without waiting for inter-robot loops.
+                if (manual_prior_pose.find(sf.robot_id) != manual_prior_pose.end())
+                {
+                    if (find(connected_robots.begin(), connected_robots.end(), sf.robot_id) == connected_robots.end())
+                    {
+                        connected_robots.emplace_back(sf.robot_id);
+                    }
+
+                    auto prior_factor = Pose3_(sf.index_to);
+                    local_graph.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise);
+                    local_graph_backup.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise);
+
+                    if (debug_)
+                    {
+                        RCLCPP_INFO(
+                            rclcpp::get_logger("optimization_log_mini"),
+                            "\033[0;36madd manual prior robot %d to global graph.\033[0m",
+                            sf.robot_id);
+                    }
+                }
 
                 #if DEBUG_GPS_CODE
                 if (abs(sf.gps_odom.pose.covariance[0]) < gps_cov_threshold_ && abs(sf.gps_odom.pose.covariance[7]) < gps_cov_threshold_)

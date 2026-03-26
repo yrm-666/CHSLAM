@@ -7,7 +7,7 @@ ScanContextDescriptor::ScanContextDescriptor(
 	float distance_threshold 	= 0.14,
 	float max_radius 			= 80.0,
 	int exclude_recent_num 		= 100,
-	std::string directory   	= "/co_lrio_output" ) :
+	std::string directory   	= "/root/cslam_ws/src/Co-LRIO/co_lrio_output" ) :
 pc_ring_num_(ring_num), // 20 in the original paper (IROS 18)
 pc_sector_num_(sector_num), // 60 in the original paper (IROS 18)
 candidates_num_(candidates_num),// 10 is enough. (refer the IROS 18 paper)
@@ -23,6 +23,12 @@ save_directory_(directory) // save file directory
 	if(directory != "")
 	{
 		sc_file_directory_ = std::getenv("HOME") + save_directory_ + "/scLoop.txt";
+		// const char* home_env = std::getenv("HOME");
+		// if (home_env) {
+		// 	sc_file_directory_ = std::string(home_env) + save_directory_ + "/scLoop.txt";
+		// } else {
+		// 	sc_file_directory_ = "/root" + save_directory_ + "/scLoop.txt";
+		// }
 		sc_file.open(sc_file_directory_);
 		sc_file.setf(ios::fixed);
 		sc_file.precision(10);
