@@ -163,7 +163,7 @@ POINT_CLOUD_REGISTER_POINT_STRUCT (PointPose6D,
  )
 
 enum class LiDARType { VELODYNE, LIVOX };
-enum class DescriptorType { ScanContext, LidarIris };
+enum class DescriptorType { ScanContext, LidarIris, MSOLDescriptor };
 enum class SystemStatus { Idle, Initialization, Start };
 
 template<typename T>

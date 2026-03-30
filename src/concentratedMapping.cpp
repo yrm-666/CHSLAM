@@ -160,6 +160,10 @@ public:
         {
             params.descriptor_type_ = DescriptorType::LidarIris;
         }
+        else if (descriptor_type == "MSOLDescriptor")
+        {
+            params.descriptor_type_ = DescriptorType::MSOLDescriptor;
+        }
         else
         {
             RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid descriptor type: %s", descriptor_type.c_str());
@@ -288,6 +292,12 @@ public:
                 80, 360, params.n_scan_, params.distance_threshold_, params.exclude_recent_num_,
                 2, params.candidates_num_, 4, 18, 1.6f, 0.75f, params.save_directory_));
         }
+        else if (params.descriptor_type_ == DescriptorType::MSOLDescriptor)
+        {
+            scan_descriptor = unique_ptr<ScanDescriptor>(new MSOLDescriptor(
+                80, 360, params.n_scan_, params.distance_threshold_, params.exclude_recent_num_,
+                2, params.candidates_num_, 4, 18, 1.6f, 0.75f, params.save_directory_));
+        }
 
         /* global robust optimizer */
         optimizer = unique_ptr<RobustOptimizer>(new RobustOptimizer(true, params.enable_risam_, SolverType::GaussNewton,
@@ -341,7 +351,7 @@ public:
     void performInterLoopClosure()
     {
         // early return
-        if (inter_robot_loop_ptr >= scan_descriptor->getSize())
+        if (inter_robot_loop_ptr >= scan_descriptor->getSize())     //越界保护  scan_descriptor->getSize()为描述子的索引大小  
         {
             return;
         }
@@ -360,7 +370,7 @@ public:
 
         for (const auto& candidate : candidates)
         {
-            if (!params.enable_loop_ && robot_key.first!=get<0>(candidate))
+            if (!params.enable_loop_ && robot_key.first!=get<0>(candidate)) //
             {
                 continue;
             }
@@ -381,11 +391,11 @@ public:
     {
         auto loop_closure_msg = std::make_unique<co_lrio::msg::LoopClosure>();
 
-        loop_closure_msg->robot0 = robot0;
+        loop_closure_msg->robot0 = robot0;  
         loop_closure_msg->key0 = key0;
         loop_closure_msg->robot1 = robot1;
         loop_closure_msg->key1 = key1;
-        loop_closure_msg->yaw_diff = yaw_diff;
+        loop_closure_msg->yaw_diff = yaw_diff;    //yaw_diff为两个关键帧之间的yaw差值
         loop_closure_msg->noise = 999.0;
 
         static rclcpp::SerializedMessage serialized_msg;
@@ -406,7 +416,7 @@ public:
         }
     }
 
-    void allocateMemoryAndInitialization(
+    void allocateMemoryAndInitialization(    //给某个机器人初始化/准备好后续要用的各种容器和发布对象
         const int8_t& input_robot)
     {
         // robot prefix
@@ -464,12 +474,12 @@ public:
         global_path.at(robot_id).poses.push_back(pose_stamped);
     }
 
-    void publishOptimizationResponse(
+    void publishOptimizationResponse(   //把一次优化结果封装成 OptimizationResponse 消息并发布给对应机器人。
         const int8_t& robot,
         const gtsam::Symbol& symbol,
         const co_lrio::msg::OptimizationRequest& msg,
         const gtsam::Pose3& pose,
-        const bool& flag)
+        const bool& flag) 
     {
         auto optimization_response_msg_ptr = std::make_unique<co_lrio::msg::OptimizationResponse>();
 
@@ -481,7 +491,7 @@ public:
         optimization_response_msg.at(robot).index_to = symbol;
         optimization_response_msg.at(robot).pose_to = optimized_keypose_msg;
         optimization_response_msg.at(robot).update_keyposes = flag;
-        *optimization_response_msg_ptr = optimization_response_msg.at(robot);
+        *optimization_response_msg_ptr = optimization_response_msg.at(robot);   
 
         static rclcpp::SerializedMessage serialized_msg;
         static rclcpp::Serialization<co_lrio::msg::OptimizationResponse> serializer;
@@ -495,25 +505,26 @@ public:
         const gtsam::Values& input_optimized_keyposes)
     {
         bool update_flag = find(optimizer->getConnectedRobot().begin(),optimizer->getConnectedRobot().end(),robot_id) != optimizer->getConnectedRobot().end();
-        // clear path
-        if (update_flag)
+        // clear path  
+        //判断这次优化是否涉及到“连通的机器人集合”。如果是，后面会重建这些机器人的 global_path。
+        if (update_flag)   
         {
             for (const auto& robot : optimizer->getConnectedRobot())
             {
-                global_path.at(robot).poses.clear();
+                global_path.at(robot).poses.clear();   //清空每个相关机器人的global_path
 
                 auto prior_symbol = gtsam::Symbol(robot + 'a', 0);
-                if (input_optimized_keyposes.exists(prior_symbol))
+                if (input_optimized_keyposes.exists(prior_symbol))    // prior_symbol（每个机器人第 0 帧的先验）更新 trans_to_pub 和 trans。trans_to_pub 是机器人相对于 world 的位姿，trans 是机器人相对于前一个机器人（world）的位姿。
                 {
                     auto relative_trans = gtsam::Pose3().between(input_optimized_keyposes.at<gtsam::Pose3>(prior_symbol));
-                    trans_to_pub.at(robot) = relative_trans;
+                    trans_to_pub.at(robot) = relative_trans;  
                     relative_trans = input_optimized_keyposes.at<gtsam::Pose3>(prior_symbol).between(gtsam::Pose3());
                     trans.at(robot) = relative_trans;
                 }
             }
         }
 
-        // update poses
+        // update poses  遍历所有优化后的变量，把位姿写回地图数据库
         pcl::PointCloud<PointPose6D>::Ptr keyposes_to_update(new pcl::PointCloud<PointPose6D>());
         for (const auto& key_value : input_optimized_keyposes)
         {
@@ -528,10 +539,13 @@ public:
 
             map_database->updatePose(robot, index, pose);
 
+            // update global path  如果这次优化涉及到连通的机器人集合，则更新它们的 global_path。
             if (update_flag)
             {
                 updateGlobalPath(robot, pose);
             }
+
+            //为当前机器人打包一份“优化后关键帧位姿集合（点云形式）”放进响应消息
             if (robot == robot_id)
             {
                 static PointPose6D p;
@@ -543,25 +557,26 @@ public:
                 p.pitch = local_pose.rotation().pitch();
                 p.yaw  = local_pose.rotation().yaw();
                 p.intensity = symbol.index();
-                keyposes_to_update->push_back(p);
+                keyposes_to_update->push_back(p);  //把优化后的位姿添加到 keyposes_to_update 中，后续会发布给机器人。
             }
         }
-
+        
+        // publish path 如果这次优化涉及到连通的机器人集合，则发布它们的 global_path。
         if (update_flag)
         {
-            for (const auto& robot : optimizer->getConnectedRobot())
+            for (const auto& robot : optimizer->getConnectedRobot())   //遍历所有连通的机器人，发布它们的 global_path。
             {
                 // publish path
                 if (pub_global_path.at(robot)->get_subscription_count() != 0 && !global_path.at(robot).poses.empty())
                 {
-                    global_path.at(robot).header.stamp = this->get_clock()->now();
+                    global_path.at(robot).header.stamp = this->get_clock()->now();    //用当前节点的ROS2时钟
                     global_path.at(robot).header.frame_id = params.world_frame_;
                     pub_global_path.at(robot)->publish(global_path.at(robot));
                 }
             }
         }
 
-        // buffer
+        // buffer  把优化后的位姿封装成 keyposes 消息
         pcl::toROSMsg(*keyposes_to_update, optimization_response_msg.at(robot_id).keyposes);
     }
 
@@ -716,7 +731,7 @@ public:
             return;
         }
 
-        // loop nodes
+        // loop nodes   配置可视化的参数
         int index = 1;
         visualization_msgs::msg::Marker nodes;
         nodes.header.frame_id = "world";
@@ -738,7 +753,7 @@ public:
         nodes.color.a = 1.0f;
         nodes.frame_locked = true;
 
-        // loop edges
+        // loop edges  
         visualization_msgs::msg::Marker constraints;
         constraints.header.frame_id = "world";
         constraints.header.stamp = this->get_clock()->now();

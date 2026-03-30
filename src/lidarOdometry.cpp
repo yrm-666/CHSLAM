@@ -290,6 +290,10 @@ public:
         {
             params.descriptor_type_ = DescriptorType::LidarIris;
         }
+        else if (descriptor_type == "MSOLDescriptor")
+        {
+            params.descriptor_type_ = DescriptorType::MSOLDescriptor;
+        }
         else
         {
             RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid descriptor type: %s", descriptor_type.c_str());
@@ -407,7 +411,7 @@ public:
         keyposes_cloud.reset(new pcl::PointCloud<PointPose3D>());
         transformed_keyframes.clear();
 
-        // scan message info
+        // scan message info   记录激光雷达点云的时间戳和起始、结束时间 
         scan_time = 1;
         scan_start_time = -1;
         scan_end_time = -1;
@@ -452,6 +456,17 @@ public:
             scan_descriptor = std::unique_ptr<ScanDescriptor>(new lidarIrisDescriptor(
                 80, 360, params.n_scan_, 0, 0, 2, 0, 4, 18, 1.6f, 0.75f, ""));
         }
+        else if (params.descriptor_type_ == DescriptorType::MSOLDescriptor)
+        {
+            scan_descriptor = std::unique_ptr<ScanDescriptor>(new MSOLDescriptor(
+                80, 360, params.n_scan_, 0, 0, 2, 0, 4, 18, 1.6f, 0.75f, ""));
+        }
+        else
+        {
+            RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid descriptor type: %s", params.descriptor_type_.c_str());
+            rclcpp::shutdown();
+        }
+
         loop_closure_candidates.clear();
         loop_closure_voxelgrid.setLeafSize(params.leaf_size_, params.leaf_size_, params.leaf_size_);
         map_cloud.reset(new pcl::PointCloud<PointPose3D>());
@@ -470,6 +485,7 @@ public:
 
     }
 
+    //判断保存关键帧 根据相对位姿和阈值判断是否保存关键帧 
     bool saveKeyframe()
     {
         const auto bet_pose = pre_keypose.between(current_pose);
@@ -512,6 +528,7 @@ public:
         pub_optimization_response->publish(serialized_msg);
     }
 
+    //发布关键帧 
     void sendOptimizationRequest()
     {   
         auto request_info_msg = std::make_unique<co_lrio::msg::OptimizationRequest>();
@@ -531,7 +548,7 @@ public:
         request_info_msg->index_to = gtsam::Symbol(params.id_ + 'a', this_index);
         request_info_msg->pose_from = gtsamPoseToOdometryMsg(pre_keypose);
         request_info_msg->pose_to = gtsamPoseToOdometryMsg(current_pose);
-
+        //？？uwb到底用来干啥的 
         // get nearest distance measurement
         while(!distance_measurement_queue.empty())
         {
@@ -575,6 +592,7 @@ public:
         pub_scan->publish(std::move(scan_cloud_msg));
     }
 
+//激光点云处理 输入：激光点云 输出：处理后的激光点云 处理内容：时间戳、畸变矫正、下采样 
     void cloudHandler(
         const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
@@ -906,6 +924,7 @@ public:
         return ImuMeasurement(imu_in->header.stamp, acceleration, velocity, orientation);
     }
 
+    //imu回调数据处理 输入：imu数据 输出：处理后的imu数据 处理内容：时间戳、畸变矫正、下采样  （预积分 
     void imuHandler(
         const sensor_msgs::msg::Imu::SharedPtr msg)
     {
@@ -942,42 +961,43 @@ public:
         }
     }
 
-    void uwbRangingHandler(
-        const std_msgs::msg::Float64MultiArray::ConstSharedPtr msg)
-    {
-        // store message
-        const int this_uwb_id = msg->data[0]; // default setting id of uwb
-        const int stamp_sec = msg->data[1]; // ros timestamp
-        const int stamp_nsec = msg->data[2];
-        const rclcpp::Time msg_stamp(stamp_sec, stamp_nsec); 
-        const unsigned int local_time = msg->data[3]; // local_time。
-        const unsigned int system_time = msg->data[4]; // system_time
-        const int thiss_num = msg->layout.dim[0].size; // other uwb distance
-        const int offset = msg->layout.data_offset;
-        const int width = msg->layout.dim[1].size;
+    // void uwbRangingHandler(
+    //     const std_msgs::msg::Float64MultiArray::ConstSharedPtr msg)
+    // {
+    //     // store message
+    //     const int this_uwb_id = msg->data[0]; // default setting id of uwb
+    //     const int stamp_sec = msg->data[1]; // ros timestamp
+    //     const int stamp_nsec = msg->data[2];
+    //     const rclcpp::Time msg_stamp(stamp_sec, stamp_nsec); 
+    //     const unsigned int local_time = msg->data[3]; // local_time。
+    //     const unsigned int system_time = msg->data[4]; // system_time
+    //     const int thiss_num = msg->layout.dim[0].size; // other uwb distance
+    //     const int offset = msg->layout.data_offset;
+    //     const int width = msg->layout.dim[1].size;
 
-        DistanceMeasurements thiss(msg_stamp);
-        for (int i = 0; i < thiss_num; i++)
-        {
-            DistanceMeasurement distence_this(
-                msg->data[offset + i * width + 0],
-                msg->data[offset + i * width + 1],
-                msg->data[offset + i * width + 2],
-                msg->data[offset + i * width + 3]
-            );
-            thiss.addDistance(distence_this);
-        }
+    //     DistanceMeasurements thiss(msg_stamp);
+    //     for (int i = 0; i < thiss_num; i++)
+    //     {
+    //         DistanceMeasurement distence_this(
+    //             msg->data[offset + i * width + 0],
+    //             msg->data[offset + i * width + 1],
+    //             msg->data[offset + i * width + 2],
+    //             msg->data[offset + i * width + 3]
+    //         );
+    //         thiss.addDistance(distence_this);
+    //     }
 
-        // store message
-        distance_measurement_queue.emplace_back(thiss);
-    }
+    //     // store message
+    //     distance_measurement_queue.emplace_back(thiss);
+    // }
 
+    //近全局地图处理 输入：近全局地图 应该是后续作全局地图匹配 
     void nearGlobalMapHandler(
         const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
     {
         pcl::fromROSMsg(*msg, *near_global_frames);
     }
-
+  
     void updatePath(const gtsam::Pose3& pose_in)
     {
         geometry_msgs::msg::PoseStamped pose_stamped;
@@ -992,8 +1012,9 @@ public:
         global_path.poses.push_back(pose_stamped);
     }
 
+    //接受中心处理器返回的优化结果 然后用这个结果修正本机保存的 关键帧位姿 并更新当前里程计的状态 
     void optimizationResponseHandler(
-        const std::shared_ptr<rclcpp::SerializedMessage> serialized_msg)
+        const std::shared_ptr<rclcpp::SerializedMessage> serialized_msg) 
     {
         static co_lrio::msg::OptimizationResponse msg;
         static auto serializer = rclcpp::Serialization<co_lrio::msg::OptimizationResponse>();
@@ -1261,7 +1282,7 @@ public:
         serializer.deserialize_message(serialized_msg.get(), &msg);
 
         system_monitor->addReceviedMsg(serialized_msg->size());
-
+      // 回环两端都在本机 
         if (msg.robot0 == params.id_ && msg.robot1 == params.id_)
         {
             LoopClosure lc(msg.robot0, msg.key0, msg.robot1, msg.key1, msg.yaw_diff);
@@ -1546,6 +1567,10 @@ public:
                 initial_yaw_ = (init_yaw)*2*M_PI/60.0;
             }
             else if (params.descriptor_type_ == DescriptorType::LidarIris)
+            {
+                initial_yaw_ = (init_yaw)*2*M_PI/360.0;
+            }
+            else if (params.descriptor_type_ == DescriptorType::MSOLDescriptor)
             {
                 initial_yaw_ = (init_yaw)*2*M_PI/360.0;
             }
