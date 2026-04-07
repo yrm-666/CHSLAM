@@ -160,9 +160,9 @@ public:
         {
             params.descriptor_type_ = DescriptorType::LidarIris;
         }
-        else if (descriptor_type == "MSOLDescriptor")
+        else if (descriptor_type == "MultiSector")
         {
-            params.descriptor_type_ = DescriptorType::MSOLDescriptor;
+            params.descriptor_type_ = DescriptorType::MultiSector;
         }
         else
         {
@@ -292,9 +292,9 @@ public:
                 80, 360, params.n_scan_, params.distance_threshold_, params.exclude_recent_num_,
                 2, params.candidates_num_, 4, 18, 1.6f, 0.75f, params.save_directory_));
         }
-        else if (params.descriptor_type_ == DescriptorType::MSOLDescriptor)
+        else if (params.descriptor_type_ == DescriptorType::MultiSector)
         {
-            scan_descriptor = unique_ptr<ScanDescriptor>(new MSOLDescriptor(
+            scan_descriptor = unique_ptr<ScanDescriptor>(new MultiSectorDescriptor(
                 80, 360, params.n_scan_, params.distance_threshold_, params.exclude_recent_num_,
                 2, params.candidates_num_, 4, 18, 1.6f, 0.75f, params.save_directory_));
         }
@@ -348,7 +348,7 @@ public:
 
     }
 
-    void performInterLoopClosure()
+    void performInterLoopClosure()  //执行一次回环检测 
     {
         // early return
         if (inter_robot_loop_ptr >= scan_descriptor->getSize())     //越界保护  scan_descriptor->getSize()为描述子的索引大小  
@@ -357,8 +357,8 @@ public:
         }
 
         // detect inter-robot and intra-robot loop closure
-        auto robot_key = scan_descriptor->getIndex(inter_robot_loop_ptr);
-        auto candidates = scan_descriptor->detectLoopClosure(robot_key.first, robot_key.second);
+        auto robot_key = scan_descriptor->getIndex(inter_robot_loop_ptr);   //获取当前回环检测的机器人和关键帧索引，返回值为一个pair，first为机器人id，second为关键帧索引
+        auto candidates = scan_descriptor->detectLoopClosure(robot_key.first, robot_key.second); //当前查询到的机器人进行回环检测，并将候选存入candidates中
         RCLCPP_DEBUG(rclcpp::get_logger("loop_log"), "performInterLoopClosure %d/%d", inter_robot_loop_ptr, scan_descriptor->getSize());
         inter_robot_loop_ptr++;
 
@@ -370,7 +370,7 @@ public:
 
         for (const auto& candidate : candidates)
         {
-            if (!params.enable_loop_ && robot_key.first!=get<0>(candidate)) //
+            if (!params.enable_loop_ && robot_key.first!=get<0>(candidate)) // 如果外回环检测被禁用，并且候选项是异机器人回环，则跳过该候选项
             {
                 continue;
             }
@@ -1091,7 +1091,7 @@ int main(
     auto CM = std::make_shared<co_lrio::ConcentratedMapping>(options);
     exec.add_node(CM);
 
-    thread loop_closure_detection_thread(&co_lrio::ConcentratedMapping::loopClosureDetectionThread, CM);
+    thread loop_closure_detection_thread(&co_lrio::ConcentratedMapping::loopClosureDetectionThread, CM); 
     thread visualization_thread(&co_lrio::ConcentratedMapping::visualizationThread, CM);
     thread tf_thread(&co_lrio::ConcentratedMapping::publishTfThread, CM);
     // thread update_map_thread(&co_lrio::ConcentratedMapping::updateNearMapThread, CM);

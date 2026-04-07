@@ -130,7 +130,7 @@ Eigen::MatrixXf ScanContextDescriptor::makeScancontext(
 	return sc;
 }
 
-Eigen::MatrixXf ScanContextDescriptor::makeRingkeyFromScancontext(
+Eigen::MatrixXf ScanContextDescriptor::makeRingkeyFromScancontext(  //生成环键（行平均值）
 	const Eigen::MatrixXf& desc)
 {
 	// summary: rowwise mean vector
@@ -144,7 +144,7 @@ Eigen::MatrixXf ScanContextDescriptor::makeRingkeyFromScancontext(
 	return invariant_key;
 }
 
-Eigen::MatrixXf ScanContextDescriptor::makeSectorkeyFromScancontext(
+Eigen::MatrixXf ScanContextDescriptor::makeSectorkeyFromScancontext( //生成扇键（列平均值） 
 	const Eigen::MatrixXf& desc)
 {
 	// summary: columnwise mean vector
@@ -158,7 +158,7 @@ Eigen::MatrixXf ScanContextDescriptor::makeSectorkeyFromScancontext(
 	return variant_key;
 }
 
-int ScanContextDescriptor::fastAlignUsingVkey(
+int ScanContextDescriptor::fastAlignUsingVkey(    //对齐 
 	const Eigen::MatrixXf& vkey1,
 	const Eigen::MatrixXf& vkey2)
 {
@@ -181,7 +181,7 @@ int ScanContextDescriptor::fastAlignUsingVkey(
 	return argmin_vkey_shift;
 }
 
-float ScanContextDescriptor::distDirectSC(
+float ScanContextDescriptor::distDirectSC(   //直接计算两个scan context的距离
 	const Eigen::MatrixXf& sc1,
 	const Eigen::MatrixXf& sc2) // "d" (eq 5) in the original paper (IROS 18)
 {
@@ -207,7 +207,7 @@ float ScanContextDescriptor::distDirectSC(
 	return 1.0 - sc_sim;
 }
 
-std::pair<float, int> ScanContextDescriptor::distanceBtnScanContext(
+std::pair<float, int> ScanContextDescriptor::distanceBtnScanContext(    //对齐精匹配
 	const Eigen::MatrixXf& sc1,
 	const Eigen::MatrixXf& sc2) // "D" (eq 6) in the original paper (IROS 18)
 {
@@ -242,7 +242,7 @@ std::pair<float, int> ScanContextDescriptor::distanceBtnScanContext(
 	return make_pair(min_sc_dist, argmin_shift);
 }
 
-// User-side API
+// User-side API  
 std::vector<float> ScanContextDescriptor::makeDescriptor(
 	const pcl::PointCloud<pcl::PointXYZI>::Ptr scan)
 {
@@ -251,7 +251,7 @@ std::vector<float> ScanContextDescriptor::makeDescriptor(
 
 	return std::vector<float>(sc.data(), sc.data() + sc.size());
 }
-
+ //描述子的保存与检索
 void ScanContextDescriptor::saveDescriptorAndKey(
 	const std::vector<float> descriptor,
 	const int8_t& robot,
@@ -261,6 +261,7 @@ void ScanContextDescriptor::saveDescriptorAndKey(
 	Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>> sc(descriptor.data(), pc_ring_num_, pc_sector_num_);
 
 	// ring key
+	
 	auto ringkey = makeRingkeyFromScancontext(sc);
 	// sector key
 	// auto sectorkey = makeSectorkeyFromScancontext(sc);

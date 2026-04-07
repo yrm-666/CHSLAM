@@ -74,6 +74,7 @@
 // descriptor
 #include "scanContextDescriptor.h"
 #include "lidarIrisDescriptor.h"
+#include "multiSectorDescriptor.h"
 
 rmw_qos_profile_t qos_profile_lidar
 {
@@ -163,7 +164,7 @@ POINT_CLOUD_REGISTER_POINT_STRUCT (PointPose6D,
  )
 
 enum class LiDARType { VELODYNE, LIVOX };
-enum class DescriptorType { ScanContext, LidarIris, MSOLDescriptor };
+enum class DescriptorType { ScanContext, LidarIris, MultiSector};
 enum class SystemStatus { Idle, Initialization, Start };
 
 template<typename T>
@@ -291,6 +292,10 @@ struct OdometryParams
     int intra_icp_iterations_time_;
     float inter_icp_max_correspondence_distance_;
     int inter_icp_iterations_time_;
+    // overlap verification (for loop closure geometric check)
+    double overlap_distance_threshold_ = 2.0; // meters
+    double overlap_voxel_size_ = 0.1;         // downsample voxel for overlap
+    double overlap_threshold_ = 0.6;          // required overlap ratio
     
     // cpu setting
     int number_of_cores_;
@@ -692,6 +697,7 @@ struct LoopClosure {
     gtsam::Symbol symbol0;
     gtsam::Symbol symbol1;
     float fitness_score;
+    double overlap_score;
     Measurement measurement;
     pcl::PointCloud<PointPose3D>::Ptr frame;
 
@@ -710,10 +716,11 @@ struct LoopClosure {
         frame.reset(new pcl::PointCloud<PointPose3D>());
         robot0 = r0;
         key0 = k0;
-        robot1 = r1;
+        robot1 = r1; 
         key1 = k1;
         init_yaw = yaw;
         fitness_score = 0.0;
+        overlap_score = 0.0;
         symbol0 = gtsam::Symbol(r0 + 'a', k0);
         symbol1 = gtsam::Symbol(r1 + 'a', k1);
     }

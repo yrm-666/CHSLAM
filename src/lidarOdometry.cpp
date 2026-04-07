@@ -1,6 +1,7 @@
 #include "common.h"
 #include "imuPreintegration.h"
 #include "systemMonitor.h"
+#include "seu_hfx.hpp"
 
 namespace co_lrio
 {
@@ -117,9 +118,9 @@ public:
 			RCLCPP_ERROR(rclcpp::get_logger(""), "\033[1;31mInvalid robot prefix (should be 'robot_'): %s\033[0m", prefix.c_str());
 			rclcpp::shutdown();
 		}
-        params.name_ = prefix.substr(1, prefix.size()-1); // leave '/'
-        string num_str = prefix.substr(7, prefix.size()-7);
-        params.id_ = std::stoi(num_str);
+        params.name_ = prefix.substr(1, prefix.size()-1); // remove the leading '/' in namespace
+        string num_str = prefix.substr(7, prefix.size()-7); // extract the number after 'robot_'
+        params.id_ = std::stoi(num_str); // convert the number string to an integer
 
         // simulator mode
         this->declare_parameter("simulator_mode", false);
@@ -292,7 +293,7 @@ public:
         }
         else if (descriptor_type == "MSOLDescriptor")
         {
-            params.descriptor_type_ = DescriptorType::MSOLDescriptor;
+            params.descriptor_type_ = DescriptorType::MultiSector;
         }
         else
         {
@@ -314,6 +315,14 @@ public:
         this->get_parameter("inter_icp_max_correspondence_distance", params.inter_icp_max_correspondence_distance_);
         this->declare_parameter("inter_icp_iterations_time", 30);
         this->get_parameter("inter_icp_iterations_time", params.inter_icp_iterations_time_);
+
+        // overlap verification parameters
+        this->declare_parameter("overlap_distance_threshold", 2.0);
+        this->get_parameter("overlap_distance_threshold", params.overlap_distance_threshold_);
+        this->declare_parameter("overlap_voxel_size", 0.1);
+        this->get_parameter("overlap_voxel_size", params.overlap_voxel_size_);
+        this->declare_parameter("overlap_threshold", 0.6);
+        this->get_parameter("overlap_threshold", params.overlap_threshold_);
 
         // cpu setting
         this->declare_parameter("number_of_cores", 4);
@@ -456,9 +465,9 @@ public:
             scan_descriptor = std::unique_ptr<ScanDescriptor>(new lidarIrisDescriptor(
                 80, 360, params.n_scan_, 0, 0, 2, 0, 4, 18, 1.6f, 0.75f, ""));
         }
-        else if (params.descriptor_type_ == DescriptorType::MSOLDescriptor)
+        else if (params.descriptor_type_ == DescriptorType::MultiSector)
         {
-            scan_descriptor = std::unique_ptr<ScanDescriptor>(new MSOLDescriptor(
+            scan_descriptor = std::unique_ptr<ScanDescriptor>(new MultiSectorDescriptor(
                 80, 360, params.n_scan_, 0, 0, 2, 0, 4, 18, 1.6f, 0.75f, ""));
         }
         else
@@ -505,6 +514,7 @@ public:
         return true;
     }
 
+    //发布优化结果 包含优化后的位姿和对应的关键帧索引等信息 供其他模块使用
     void publishOptimizationResponse(
         const int8_t& robot,
         const gtsam::Symbol& symbol,
@@ -528,7 +538,7 @@ public:
         pub_optimization_response->publish(serialized_msg);
     }
 
-    //发布关键帧 
+    //发布优化请求 包含当前帧的点云、描述子、位姿等信息 以及最近的UWB测距信息
     void sendOptimizationRequest()
     {   
         auto request_info_msg = std::make_unique<co_lrio::msg::OptimizationRequest>();
@@ -1274,6 +1284,7 @@ public:
         RCLCPP_DEBUG(rclcpp::get_logger("odometry"), "\033[1;36m<%s> keyframe cost time: %f ms\033[0m", params.name_.c_str(), float(duration)/1e3);
     }
 
+    //回环候选处理 输入：回环候选消息 输出：回环候选列表 处理内容：同机器人回环候选直接保存，不同机器人回环候选需要请求对方发送关键帧点云数据
     void loopClosureHandler(
         const std::shared_ptr<rclcpp::SerializedMessage> serialized_msg)
     {
@@ -1282,13 +1293,14 @@ public:
         serializer.deserialize_message(serialized_msg.get(), &msg);
 
         system_monitor->addReceviedMsg(serialized_msg->size());
-      // 回环两端都在本机 
+      
+        //同机器人
         if (msg.robot0 == params.id_ && msg.robot1 == params.id_)
         {
             LoopClosure lc(msg.robot0, msg.key0, msg.robot1, msg.key1, msg.yaw_diff);
-            loop_closure_candidates.emplace_back(lc);
+            loop_closure_candidates.emplace_back(lc); // 本地回环候选 
         }
-        else if (int(msg.noise) == 999 && msg.robot0 == params.id_ && msg.key0 < keyframes.size())
+        else if (int(msg.noise) == 999 && msg.robot0 == params.id_ && msg.key0 < keyframes.size()) // 
         {
             auto loop_closure_msg = std::make_unique<co_lrio::msg::LoopClosure>();
 
@@ -1303,9 +1315,9 @@ public:
             static rclcpp::SerializedMessage serialized_msg;
             static rclcpp::Serialization<co_lrio::msg::LoopClosure> serializer;
             serializer.serialize_message(loop_closure_msg.get(), &serialized_msg);
-            pub_loop_closure->publish(serialized_msg);
+            pub_loop_closure->publish(serialized_msg); 
         }
-        else if (int(msg.noise) == 888 && msg.robot1 == params.id_)
+        else if (int(msg.noise) == 888 && msg.robot1 == params.id_) // 
         {
             LoopClosure lc(msg.robot0, msg.key0, msg.robot1, msg.key1, msg.yaw_diff, msg.frame);
             loop_closure_candidates.emplace_back(lc);
@@ -1513,6 +1525,7 @@ public:
         return cloudOut;
     }
 
+//提取近全局地图 输入：回环候选的关键帧id和搜索数量 输出：近全局地图点云 处理内容：根据回环候选的关键帧id提取附近的关键帧，并将这些关键帧的点云进行变换后融合成近全局地图
     pcl::PointCloud<PointPose3D>::Ptr surroundingMap(
         const int& query_key,
         const int& search_num)
@@ -1570,9 +1583,9 @@ public:
             {
                 initial_yaw_ = (init_yaw)*2*M_PI/360.0;
             }
-            else if (params.descriptor_type_ == DescriptorType::MSOLDescriptor)
+            else if (params.descriptor_type_ == DescriptorType::MultiSector)
             {
-                initial_yaw_ = (init_yaw)*2*M_PI/360.0;
+                initial_yaw_ = (init_yaw)*2*M_PI/24.0;
             }
             if (initial_yaw_ > M_PI)
             {
@@ -1580,7 +1593,7 @@ public:
             }
             
             auto init_pose = keyposes[loop_key1];
-            loop_pose0 = gtsam::Pose3(
+            loop_pose0 = gtsam::Pose3(  // 以 loop_key1 的位姿为基础，添加初始 yaw 差值，得到 loop_key0 的初始位姿
                 gtsam::Rot3::RzRyRx(init_pose.rotation().roll(), init_pose.rotation().pitch(), init_pose.rotation().yaw() + initial_yaw_),
                 gtsam::Point3(init_pose.translation().x(), init_pose.translation().y(), init_pose.translation().z()));
 
@@ -1596,8 +1609,8 @@ public:
         pcl::PointCloud<pcl::PointXYZI>::Ptr scan_cloud_filtered(new pcl::PointCloud<pcl::PointXYZI>);
         loop_closure_voxelgrid.filter(*scan_cloud_filtered);
         // target pointcloud of scan2map matching
-        loop_pose1 = keyposes[loop_key1];
-        *map_cloud = *surroundingMap(loop_key1, params.history_keyframe_search_num_);
+        loop_pose1 = keyposes[loop_key1]; 
+        *map_cloud = *surroundingMap(loop_key1, params.history_keyframe_search_num_); // 提取近全局地图
         loop_closure_voxelgrid.setInputCloud(map_cloud);
         pcl::PointCloud<pcl::PointXYZI>::Ptr map_cloud_filtered(new pcl::PointCloud<pcl::PointXYZI>);
         loop_closure_voxelgrid.filter(*map_cloud_filtered);
@@ -1638,6 +1651,48 @@ public:
         RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] GICP passed (%.2f < %.2f). Add.\033[0m",
             loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, fitness, params.fitness_score_threshold_);
 
+        // ---- overlap 验证（与 LoopClosureDetector / HL_BPR_v2.cpp 保持一致） ----
+        try {
+            // convert filtered clouds (PointXYZI) -> PointXYZ
+            pcl::PointCloud<pcl::PointXYZ>::Ptr src_xyz(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::PointCloud<pcl::PointXYZ>::Ptr map_xyz(new pcl::PointCloud<pcl::PointXYZ>);
+            src_xyz->reserve(scan_cloud_filtered->size());
+            map_xyz->reserve(map_cloud_filtered->size());
+            for (const auto &p : scan_cloud_filtered->points)
+            {
+                pcl::PointXYZ q; q.x = p.x; q.y = p.y; q.z = p.z; src_xyz->push_back(q);
+            }
+            for (const auto &p : map_cloud_filtered->points)
+            {
+                pcl::PointXYZ q; q.x = p.x; q.y = p.y; q.z = p.z; map_xyz->push_back(q);
+            }
+
+            // transform source by final GICP transformation
+            Eigen::Matrix4f T_gicp = gicp_loop.getFinalTransformation();
+            pcl::PointCloud<pcl::PointXYZ>::Ptr src_transformed(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::transformPointCloud(*src_xyz, *src_transformed, T_gicp);
+
+            // compute overlap score
+            const double overlap = computeOverlapFast(src_transformed, map_xyz,
+                                                     static_cast<float>(params.overlap_distance_threshold_),
+                                                     static_cast<float>(params.overlap_voxel_size_));
+            lc_result.fitness_score = fitness;
+            lc_result.overlap_score = overlap;
+
+            if (overlap < params.overlap_threshold_)
+            {
+                RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] Overlap failed (%.3f < %.3f). Reject.\033[0m",
+                    loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, overlap, params.overlap_threshold_);
+                return make_pair(0, lc_result);
+            }
+            RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] Overlap passed (%.3f >= %.3f).\033[0m",
+                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, overlap, params.overlap_threshold_);
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_WARN(rclcpp::get_logger("loop_verify_log"), "computeOverlapFast failed: %s", e.what());
+        }
+
         // get corrected pose transformation
         const auto pose_from = gtsam::Pose3(gicp_loop.getFinalTransformation().cast<double>());
         const auto pose_to = loop_pose1;
@@ -1651,11 +1706,12 @@ public:
         measurement.pose = pose_from.between(pose_to);
         measurement.covariance = loop_noise->covariance();
         lc_result.measurement = measurement;
-        lc_result.fitness_score = fitness;
+        lc_result.fitness_score = fitness;    //置信度这边考虑要不要优化（比如结合 overlap score，或者利用自适应的置信度）
 
-        return make_pair(1, lc_result);
+        return make_pair(1, lc_result);   //这个返回的结果可以再考虑要不要修改
     }
-
+    
+    // 发布回环优化请求到中心处理器 （加入回环因子）
     void publish_optimization_request(
         const int8_t& robot0,
         const gtsam::Symbol& symbol0,
@@ -1678,6 +1734,7 @@ public:
         pub_optimization_request->publish(serialized_msg);
     }
 
+    // 后台回环验证线程，持续验证回环候选者的有效性  
     void loopClosureVerificationThread()
     {
         rclcpp::Rate rate(1.0/params.loop_detection_interval_);
@@ -1697,7 +1754,7 @@ public:
                 {
                     auto lc = result.second;
                     publish_optimization_request(lc.robot1, lc.symbol0, lc.symbol1, lc.measurement.pose, lc.fitness_score);
-                    RCLCPP_INFO(rclcpp::get_logger("loop_log"), "calculateTransformation with %f s", end_time - start_time);
+                    RCLCPP_INFO(rclcpp::get_logger("loop_log"), "calculateTransformation with %f s", end_time - start_time);   //在这里考虑回环效率！！！！！！！！！！！！！
                 }
                 else if (result.first == -1)
                 {
@@ -1726,7 +1783,7 @@ int main(
     auto LO = std::make_shared<co_lrio::LidarOdometry>(options);
     exec.add_node(LO);
 
-    thread loop_closure_verification_thread(&co_lrio::LidarOdometry::loopClosureVerificationThread, LO);
+    thread loop_closure_verification_thread(&co_lrio::LidarOdometry::loopClosureVerificationThread, LO);  // 启动回环验证线程
     loop_closure_verification_thread.detach();
 
     RCLCPP_INFO(rclcpp::get_logger(""), "\033[1;32mNode %s %s Started.\033[0m", LO->get_namespace(), LO->get_name());
