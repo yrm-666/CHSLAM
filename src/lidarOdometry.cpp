@@ -2,6 +2,7 @@
 #include "imuPreintegration.h"
 #include "systemMonitor.h"
 #include "seu_hfx.hpp"
+#include "loop_closure_detector.hpp"
 
 namespace co_lrio
 {
@@ -303,6 +304,12 @@ public:
         RCLCPP_INFO(rclcpp::get_logger(""), "\033[1;32mdescriptors: %s.\033[0m", descriptor_type.c_str());
         this->declare_parameter("max_radius", 80.0f);
         this->get_parameter("max_radius", params.max_radius_);
+        this->declare_parameter("candidates_num", 6);
+        this->get_parameter("candidates_num", params.candidates_num_);
+        this->declare_parameter("distance_threshold", 0.14f);
+        this->get_parameter("distance_threshold", params.distance_threshold_);
+        this->declare_parameter("exclude_recent_num", 100);
+        this->get_parameter("exclude_recent_num", params.exclude_recent_num_);
         this->declare_parameter("history_keyframe_search_num", 16);
         this->get_parameter("history_keyframe_search_num", params.history_keyframe_search_num_);
         this->declare_parameter("fitness_score_threshold", 0.2f);
@@ -468,11 +475,18 @@ public:
         else if (params.descriptor_type_ == DescriptorType::MultiSector)
         {
             scan_descriptor = std::unique_ptr<ScanDescriptor>(new MultiSectorDescriptor(
-                80, 360, params.n_scan_, 0, 0, 2, 0, 4, 18, 1.6f, 0.75f, ""));
+                24,                    // sector_num
+                params.max_radius_,    // max_range
+                3,                     // min_points (per sector)
+                params.candidates_num_,// candidates_num
+                params.distance_threshold_, // distance_threshold
+                params.exclude_recent_num_, // exclude_recent
+                ""                   // directory (empty for runtime)
+            ));
         }
         else
         {
-            RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid descriptor type: %s", params.descriptor_type_.c_str());
+            RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid descriptor type: %s", descriptor_type.c_str());
             rclcpp::shutdown();
         }
 
@@ -946,7 +960,7 @@ public:
         if (imu_preintegration->isInitialized())
         {
             // publish odometry
-            pub_imu_odometry->publish(odom);
+            pub_imu_odometry->publish(odom);  // 发布IMU里程计，包含当前位姿和速度等信息，供其他模块使用
 
             // publish tf
             tf2::Stamped<tf2::Transform> trans_lidar_2_base;
@@ -971,35 +985,35 @@ public:
         }
     }
 
-    // void uwbRangingHandler(
-    //     const std_msgs::msg::Float64MultiArray::ConstSharedPtr msg)
-    // {
-    //     // store message
-    //     const int this_uwb_id = msg->data[0]; // default setting id of uwb
-    //     const int stamp_sec = msg->data[1]; // ros timestamp
-    //     const int stamp_nsec = msg->data[2];
-    //     const rclcpp::Time msg_stamp(stamp_sec, stamp_nsec); 
-    //     const unsigned int local_time = msg->data[3]; // local_time。
-    //     const unsigned int system_time = msg->data[4]; // system_time
-    //     const int thiss_num = msg->layout.dim[0].size; // other uwb distance
-    //     const int offset = msg->layout.data_offset;
-    //     const int width = msg->layout.dim[1].size;
+    void uwbRangingHandler(
+        const std_msgs::msg::Float64MultiArray::ConstSharedPtr msg)
+    {
+        // store message
+        const int this_uwb_id = msg->data[0]; // default setting id of uwb
+        const int stamp_sec = msg->data[1]; // ros timestamp
+        const int stamp_nsec = msg->data[2];
+        const rclcpp::Time msg_stamp(stamp_sec, stamp_nsec); 
+        const unsigned int local_time = msg->data[3]; // local_time。
+        const unsigned int system_time = msg->data[4]; // system_time
+        const int thiss_num = msg->layout.dim[0].size; // other uwb distance
+        const int offset = msg->layout.data_offset;
+        const int width = msg->layout.dim[1].size;
 
-    //     DistanceMeasurements thiss(msg_stamp);
-    //     for (int i = 0; i < thiss_num; i++)
-    //     {
-    //         DistanceMeasurement distence_this(
-    //             msg->data[offset + i * width + 0],
-    //             msg->data[offset + i * width + 1],
-    //             msg->data[offset + i * width + 2],
-    //             msg->data[offset + i * width + 3]
-    //         );
-    //         thiss.addDistance(distence_this);
-    //     }
+        DistanceMeasurements thiss(msg_stamp);
+        for (int i = 0; i < thiss_num; i++)
+        {
+            DistanceMeasurement distence_this(
+                msg->data[offset + i * width + 0],
+                msg->data[offset + i * width + 1],
+                msg->data[offset + i * width + 2],
+                msg->data[offset + i * width + 3]
+            );
+            thiss.addDistance(distence_this);
+        }
 
-    //     // store message
-    //     distance_measurement_queue.emplace_back(thiss);
-    // }
+        // store message
+        distance_measurement_queue.emplace_back(thiss);
+    }
 
     //近全局地图处理 输入：近全局地图 应该是后续作全局地图匹配 
     void nearGlobalMapHandler(
@@ -1793,3 +1807,9 @@ int main(
 
     return 0;
 }
+
+
+
+//回环在内回环和外回环之间考虑优先级或者自适应，比如当内回环的 fitness score 很好时，优先添加内回环；当内回环的 fitness score 较差时，考虑添加外回环（如果外回环的 fitness score 较好）。
+//或者也可以同时添加内外回环，但在优化时给予 fitness score 更高的回环更大的权重。
+//优化器 的各个因子考虑插入

@@ -639,6 +639,8 @@ float lidarIrisDescriptor::compare(
 	{
 		std::cout << "exception" << ex.what() << std::endl;
 	}
+    // on exception return NAN to indicate invalid comparison
+    return NAN;
 }
 
 // user-side API

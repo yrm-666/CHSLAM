@@ -32,7 +32,7 @@
 #include <pcl/common/transforms.h>
 #include <Eigen/Core>
 
-#include <fast_gicp/gicp/fast_gicp.hpp>
+#include <third_parties/gicp/fast_gicp.hpp>
 
 
 // ============================================================

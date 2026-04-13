@@ -61,9 +61,12 @@
     ransac_iterations_time: 5
 
     # loop detection setting
-    descriptor_type: "ScanContext"
+    # descriptor_type: "ScanContext"
+    # distance_threshold: 0.25 # 0.45
+    # candidates_num: 20       
+    descriptor_type: "MultiSector"
     distance_threshold: 0.25 # 0.45
-    candidates_num: 20            
+    candidates_num: 20      
     # descriptor_type: "LidarIris"
     # distance_threshold: 0.35 # 0.5
     # candidates_num: 20

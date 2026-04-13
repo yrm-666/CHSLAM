@@ -45,26 +45,10 @@ float ScanContextDescriptor::xy2theta(
 	float& _x,
 	float& _y)
 {
-	// first quadrant
-	if((_x >= 0) & (_y >= 0))
-	{
-		return (180/M_PI) * atan(_y / _x);
-	}
-	// second quadrant
-	if((_x < 0) & (_y >= 0))
-	{
-		return 180 - ((180/M_PI) * atan(_y / (-_x)));
-	}
-	// third quadrant
-	if((_x < 0) & (_y < 0))
-	{
-		return 180 + ((180/M_PI) * atan(_y / _x));
-	}
-	// forth quadrant
-	if((_x >= 0) & (_y < 0))
-	{
-		return 360 - ((180/M_PI) * atan((-_y) / _x));
-	}
+	// Use atan2 for robust quadrant-aware angle computation
+	double ang = std::atan2(static_cast<double>(_y), static_cast<double>(_x)) * 180.0 / M_PI;
+	if (ang < 0.0) ang += 360.0;
+	return static_cast<float>(ang);
 }
 
 Eigen::MatrixXf ScanContextDescriptor::circshift(

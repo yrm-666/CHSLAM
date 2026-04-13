@@ -32,22 +32,22 @@ private:
     noiseModel::Diagonal::shared_ptr prior_noise;
     noiseModel::Diagonal::shared_ptr imu_noise;
     noiseModel::Diagonal::shared_ptr odometry_noise;
-    noiseModel::Diagonal::shared_ptr ranging_noise;
+    noiseModel::Diagonal::shared_ptr ranging_noise; // uwb
 
     deque<PairwiseDistance> pairwise_distances;
     std::unordered_map<int, std::unordered_map<int, pair<gtsam::Symbol, float>>> dis_map;
-    std::unordered_map<int, int> imu_symbol_ptr;
+    std::unordered_map<int, int> imu_symbol_ptr; 
 
     // global isam2
     gtsam::Symbol latest_symbol;
     std::unordered_map<int, shared_ptr<gtsam::Values>> keyposes_optimized;
     // shared_ptr<ISAM2> isam_global;
-    Vector gnc_weights;
-    shared_ptr<gtsam::NonlinearFactorGraph> graduated_graph;
-    shared_ptr<gtsam::NonlinearFactorGraph> inlier_graph;
-    shared_ptr<gtsam::Values> global_estimate;
-    shared_ptr<gtsam::ExpressionFactorGraph> graph;
-    shared_ptr<gtsam::ExpressionFactorGraph> graph_backup;
+    Vector gnc_weights;  // for GNC
+    shared_ptr<gtsam::NonlinearFactorGraph> graduated_graph; //存放GNC的特殊因子
+    shared_ptr<gtsam::NonlinearFactorGraph> inlier_graph; //存放被判定为inlier的因子
+    shared_ptr<gtsam::Values> global_estimate; // 存放全局优化的结果
+    shared_ptr<gtsam::ExpressionFactorGraph> graph; // 存放当前的因子图 主用的表达式图（存放跨机器人回环、range 因子等“特殊/全局”表达式因子）
+    shared_ptr<gtsam::ExpressionFactorGraph> graph_backup; // 因为risam的update会修改因子图，所以需要一个备份
 
     risam::RISAM2::RISAM2Params riparams;
     boost::shared_ptr<risam::RISAM2> risam_global;
@@ -181,7 +181,7 @@ public:
         manual_prior_pose[robot_id] = pose;
     }
 
-    void addRobot(
+    void addRobot( //为新机器人构建因子图等等等 并且更新邻接矩阵
         const int8_t& robot_id)
     {
         // robot vector
@@ -233,19 +233,19 @@ public:
     {
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        auto do_optimize = saveFactor(sf, indexes);
+        auto do_optimize = saveFactor(sf, indexes); //将当前帧的因子添加到因子图中，并且判断是否满足优化条件（如是否是里程计、是否有足够的约束等），满足则返回true，不满足则返回false
 
         if (do_optimize)
         {
-            sf.outlier = optimize(sf.isOdom);
+            sf.outlier = optimize(sf.isOdom); //满足优化条件后进行优化，并且返回是否是外点，里程计的优化结果如果和预积分的结果差距过大则认为是外点
 
-            auto old_pose_to = sf.pose_to;
-            gtsam::Pose3 new_pose_to, prior_tmp;
-            if (enable_risam_ && find(connected_robots.begin(),connected_robots.end(),sf.robot_id) != connected_robots.end())
+            auto old_pose_to = sf.pose_to; //保存优化前该帧的位姿
+            gtsam::Pose3 new_pose_to, prior_tmp;  
+            if (enable_risam_ && find(connected_robots.begin(),connected_robots.end(),sf.robot_id) != connected_robots.end()) //如果启用了risam并且当前机器人被并入连同机器人全局
             {
                 prior_tmp = global_estimate->at<gtsam::Pose3>(gtsam::Symbol(sf.robot_id + 'a', 0));
                 auto trans_tmp = global_estimate->at<gtsam::Pose3>(gtsam::Symbol(sf.robot_id + 'a', 0)).between(gtsam::Pose3());
-                new_pose_to = trans_tmp.compose(getLatestValue(sf.robot_id));
+                new_pose_to = trans_tmp.compose(getLatestValue(sf.robot_id));   
             }
             else
             {
@@ -409,7 +409,7 @@ private:
         }
     }
 
-    bool verificateDistance(PairwiseDistance pairwise_distance)
+    bool verificateDistance(PairwiseDistance pairwise_distance)  //验证距离约束是否满足条件，满足则添加到因子图中，不满足则丢弃
     {
         // find poses
         if (find(connected_robots.begin(),connected_robots.end(), pairwise_distance.robot_current) == connected_robots.end() ||
@@ -561,14 +561,14 @@ private:
     {
         latest_symbol = sf.index_to;
 
-        if (sf.index_from.chr() == sf.index_to.chr())
+        if (sf.index_from.chr() == sf.index_to.chr())  //同机器人 
         {
             // prior factor
-            if (sf.index_to.index() == 0 && sf.index_from.index() == 0)
+            if (sf.index_to.index() == 0 && sf.index_from.index() == 0) //索引为0 
             {
                 // prior_pose.emplace(make_pair(sf.robot_id, sf.pose_to));
                 auto initial_pose = sf.pose_to;
-                if (manual_prior_pose.find(sf.robot_id) != manual_prior_pose.end())
+                if (manual_prior_pose.find(sf.robot_id) != manual_prior_pose.end()) // 如果用户指定了先验位姿，则使用用户指定的位姿作为先验约束的测量值
                 {
                     initial_pose = manual_prior_pose.at(sf.robot_id);
                 }
@@ -581,16 +581,16 @@ private:
                 local_initial_estimate_backup.at(sf.robot_id)->insert(sf.index_to, initial_pose);
 
                 // Allow a robot to join the shared world frame without waiting for inter-robot loops.
-                if (manual_prior_pose.find(sf.robot_id) != manual_prior_pose.end())
+                if (manual_prior_pose.find(sf.robot_id) != manual_prior_pose.end()) //指定先验位姿
                 {
-                    if (find(connected_robots.begin(), connected_robots.end(), sf.robot_id) == connected_robots.end())
+                    if (find(connected_robots.begin(), connected_robots.end(), sf.robot_id) == connected_robots.end()) //  如果不在已连接的机器人列表中，则添加到已连接的机器人列表中
                     {
-                        connected_robots.emplace_back(sf.robot_id);
+                        connected_robots.emplace_back(sf.robot_id);  // 添加到已连接的机器人列表中
                     }
 
-                    auto prior_factor = Pose3_(sf.index_to);
-                    local_graph.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise);
-                    local_graph_backup.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise);
+                    auto prior_factor = Pose3_(sf.index_to); // 构造先验因子，测量值为用户指定的位姿，噪声模型为预设的先验噪声模型
+                    local_graph.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise);  // 将先验因子添加到当前机器人的局部因子图中
+                    local_graph_backup.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise); // 将先验因子添加到当前机器人的局部因子图备份中
 
                     if (debug_)
                     {
@@ -608,13 +608,13 @@ private:
                 }
                 #endif
             }
-            // odom factor
+            // odom factor 相邻帧 
             else if (sf.index_to.index() == sf.index_from.index() + 1)
             {
-                auto pose_between = sf.pose_from.between(sf.pose_to);
+                auto pose_between = sf.pose_from.between(sf.pose_to); //相邻帧里程计的位姿变换 
 
                 // odometry expression
-                auto odom_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));
+                auto odom_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));  //构造里程计表达式因子，连接当前帧和前一帧，测量值为两帧之间的位姿变换，噪声模型为预设的里程计噪声模型
                 local_graph.at(sf.robot_id)->addExpressionFactor(odom_expression, pose_between, odometry_noise);
                 local_graph_backup.at(sf.robot_id)->addExpressionFactor(odom_expression, pose_between, odometry_noise);
 
@@ -803,7 +803,7 @@ private:
                 auto noise_model = noiseModel::Diagonal::Variances(
                     (Vector(6) << sf.noise, sf.noise, sf.noise, sf.noise, sf.noise, sf.noise).finished());
 
-                // intra-robot loop expression
+                // intra-robot loop expression   这里的回环因子的参数是哪里来的  这个 噪声有时
                 auto loop_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));
                 local_graph.at(sf.robot_id)->addExpressionFactor(loop_expression, pose_between, noise_model);
                 local_graph_backup.at(sf.robot_id)->addExpressionFactor(loop_expression, pose_between, noise_model);
@@ -859,8 +859,8 @@ private:
 
             LoopClosure lc(sf.index_from, sf.index_to, sf.noise, Measurement(pose_between, noise_model->covariance()));
 
-            // judge
-            if (adjacency_matrix(lc.robot0, lc.robot1) > loop_num_threshold_
+            // judge  
+            if (adjacency_matrix(lc.robot0, lc.robot1) > loop_num_threshold_  
                 && find(connected_robots.begin(),connected_robots.end(), lc.robot1) != connected_robots.end()
                 && find(connected_robots.begin(),connected_robots.end(), lc.robot0) != connected_robots.end())
             {
@@ -910,9 +910,9 @@ private:
                 }
             }
             else
-            {
+            { 
                 // update ordering
-                if (connected_robots.size() < all_robots.size())
+                if (connected_robots.size() < all_robots.size())  
                 {   
                     // push the prior ownner robot
                     if (connected_robots.empty())
@@ -1011,7 +1011,7 @@ private:
         return true;
     }
 
-    bool optimize(const bool is_odom)
+    bool optimize(const bool is_odom)  //GNC优化 
     {
         auto start_time = std::chrono::high_resolution_clock::now();
         

@@ -5,6 +5,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Require C++17 for inline variables and structured bindings used in headers
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
@@ -23,6 +27,7 @@ find_package(tf2_eigen REQUIRED)
 find_package(libstatistics_collector REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(PythonLibs REQUIRED)
 find_package(OpenMP)
 if (OPENMP_FOUND)
   set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
@@ -31,6 +36,8 @@ endif()
 find_package(PCL REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(Eigen REQUIRED)
+find_package(teaserpp REQUIRED)
+find_package(Sophus REQUIRED)
 
 # Include directories
 include_directories(
@@ -39,6 +46,8 @@ include_directories(
   ${EIGEN_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
+  ${PYTHON_INCLUDE_DIRS}
+  include/pmc
 )
 
 # Defined message and service
@@ -122,6 +131,31 @@ install(
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+#PMC
+add_library(pmc SHARED
+  src/pmc/pmc_heu.cpp
+  src/pmc/pmc_maxclique.cpp
+  src/pmc/pmcx_maxclique.cpp
+  src/pmc/pmcx_maxclique_basic.cpp
+  src/pmc/pmc_cores.cpp
+  src/pmc/pmc_utils.cpp
+  src/pmc/pmc_graph.cpp
+  src/pmc/pmc_clique_utils.cpp
+  src/pmc/pmc_lib.cpp
+)
+target_link_libraries(pmc
+  ${PCL_LIBRARIES}
+)
+if (OPENMP_FOUND)
+    if (TARGET OpenMP::OpenMP_CXX)
+        target_link_libraries(pmc OpenMP::OpenMP_CXX)
+    endif ()
+endif ()
+target_include_directories(pmc PUBLIC
+  include
+  ${PCL_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
+)
 
 # gicp library
 add_library(gicp_lib
@@ -158,25 +192,38 @@ install(
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+target_link_libraries(gicp_lib
+  ${PCL_LIBRARIES}
+)
+if (OPENMP_FOUND)
+    if (TARGET OpenMP::OpenMP_CXX)
+        target_link_libraries(gicp_lib OpenMP::OpenMP_CXX)
+    endif ()
+endif ()
+target_include_directories(gicp_lib PUBLIC
+  include
+  ${PCL_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
+)
 
 # Lidar odometry
-add_executable(${PROJECT_NAME}_lidar_odometry src/scanContextDescriptor.cpp src/lidarIrisDescriptor.cpp  src/lidarOdometry.cpp)
+add_executable(${PROJECT_NAME}_lidar_odometry src/scanContextDescriptor.cpp src/lidarIrisDescriptor.cpp src/multiSectorDescriptor.cpp src/lidarOdometry.cpp)
 ament_target_dependencies(${PROJECT_NAME}_lidar_odometry
   rclcpp rclpy
   std_msgs nav_msgs sensor_msgs geometry_msgs visualization_msgs pcl_msgs
   tf2 tf2_ros tf2_geometry_msgs tf2_eigen tf2_sensor_msgs
   OpenCV PCL GTSAM Eigen)
-target_link_libraries(${PROJECT_NAME}_lidar_odometry gtsam gtsam_unstable gicp_lib geographic_lib)
+target_link_libraries(${PROJECT_NAME}_lidar_odometry gtsam gtsam_unstable gicp_lib geographic_lib nabo_lib teaserpp::teaser_registration teaserpp::teaser_io pmc ${PYTHON_INCLUDE_DIRS})
 rosidl_target_interfaces(${PROJECT_NAME}_lidar_odometry ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 # Concentrated mapping
-add_executable(${PROJECT_NAME}_concentrated_mapping src/scanContextDescriptor.cpp src/lidarIrisDescriptor.cpp src/concentratedMapping.cpp)
+add_executable(${PROJECT_NAME}_concentrated_mapping src/scanContextDescriptor.cpp src/lidarIrisDescriptor.cpp src/multiSectorDescriptor.cpp src/concentratedMapping.cpp)
 ament_target_dependencies(${PROJECT_NAME}_concentrated_mapping
   rclcpp rclpy
   std_msgs nav_msgs sensor_msgs geometry_msgs visualization_msgs pcl_msgs
   tf2 tf2_ros tf2_geometry_msgs tf2_eigen tf2_sensor_msgs
   OpenCV PCL GTSAM Eigen)
-target_link_libraries(${PROJECT_NAME}_concentrated_mapping gtsam risam_lib fast_max_clique_finder nabo_lib gicp_lib geographic_lib)
+target_link_libraries(${PROJECT_NAME}_concentrated_mapping gtsam risam_lib fast_max_clique_finder nabo_lib gicp_lib geographic_lib teaserpp::teaser_registration teaserpp::teaser_io pmc ${PYTHON_INCLUDE_DIRS})
 rosidl_target_interfaces(${PROJECT_NAME}_concentrated_mapping ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 install(

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <omp.h>
 #include <mutex>
 #include <math.h>
@@ -7,11 +9,11 @@
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
-#include <ros/ros.h>
+#include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <visualization_msgs/Marker.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -25,14 +27,14 @@
 #include <pcl/filters/approximate_voxel_grid.h>
 #include <pcl/registration/ndt.h>
 #include <pcl/registration/gicp.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
-#include <geometry_msgs/Vector3.h>
-#include <ikd-Tree/ikd_Tree.h>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/vector3.hpp>
+#include <ikd_tree/ikd_Tree.h>
 #include <yaml-cpp/yaml.h>
 #include <unordered_map>
-#include <boost/filesystem.hpp>
+#include <boost/filesystem.hpp> 
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <chrono>
@@ -54,7 +56,7 @@
 #include <fast_gicp/ndt/ndt_cuda.hpp>
 #include <fast_gicp/gicp/fast_vgicp_cuda.hpp>
 #endif
-#include <fast_gicp/gicp/fast_gicp.hpp>
+#include <third_parties/gicp/fast_gicp.hpp>
 #include <teaser/ply_io.h>
 #include <teaser/registration.h>
 namespace plt = matplotlibcpp; 
@@ -69,10 +71,10 @@ const int BEV_HEIGHT = 100;  // Height of BEV image
 const double RESOLUTION = 0.8;   // Resolution, representing the actual distance per pixel (unit: meters)
 const int EDGE_WEIGHT = 10;  // Edge weight
 const int dis_thre = 3;      // Distance threshold when reading bin files
-    // Define height intervals
-float z_min = -5.0f, z_max = 20.0f;
-float interval_size = 2.0f;  // 2 meters per interval
-int num_intervals = 13;      // 13 intervals
+    // Define height intervals (inline to avoid multiple-definition across TUs)
+    inline float z_min = -5.0f, z_max = 20.0f;
+    inline float interval_size = 2.0f;  // 2 meters per interval
+    inline int num_intervals = 13;      // 13 intervals
 // Hash function for pixel coordinates, used for hash table
 struct PixelCoordHash {
     std::size_t operator()(const std::pair<int, int>& key) const {
@@ -81,7 +83,7 @@ struct PixelCoordHash {
 };
 
 // Create lookup table function to store the count of 1s in each number from 0-8192(2^13)
-std::vector<uint16_t> create_lookup_table() {
+inline std::vector<uint16_t> create_lookup_table() {
     std::vector<uint16_t> lookup_table(1<<num_intervals, 0);
     for (int i = 0; i < 1<<num_intervals; i++) {
         int n = i;
@@ -96,10 +98,10 @@ std::vector<uint16_t> create_lookup_table() {
 }
 
 // Global lookup table
-std::vector<uint16_t> lookup_table = create_lookup_table();
+inline std::vector<uint16_t> lookup_table = create_lookup_table();
 
 // Function to read point cloud files in bin format
-void readBinFile(const std::string &file_name, pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud) 
+inline void readBinFile(const std::string &file_name, pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud) 
 {
     // Open binary file for reading
     std::ifstream input(file_name.c_str(), std::ios::binary);
@@ -138,7 +140,7 @@ void readBinFile(const std::string &file_name, pcl::PointCloud<pcl::PointXYZ>::P
 }
 
 // Function to convert PCL point cloud to BEV (Bird's Eye View)
-BEVType point_cloud_to_bev(const pcl::PointCloud<pcl::PointXYZ>::Ptr point_cloud) {
+inline BEVType point_cloud_to_bev(const pcl::PointCloud<pcl::PointXYZ>::Ptr point_cloud) {
     // Define physical size of BEV image (meters)
     double bev_size_meters = std::max(BEV_WIDTH, BEV_HEIGHT) * RESOLUTION;
     double half_size = bev_size_meters / 2;
@@ -230,7 +232,7 @@ BEVType point_cloud_to_bev(const pcl::PointCloud<pcl::PointXYZ>::Ptr point_cloud
  * @param lookup_table Lookup table for calculating Hamming distance
  * @return Correlation results
  */
-std::vector<double> binary_correlation_2d_openmp(
+inline std::vector<double> binary_correlation_2d_openmp(
     const BEVType& A,
     const BEVType& B,
     const std::vector<uint16_t>& lookup_table,
@@ -283,7 +285,7 @@ std::vector<double> binary_correlation_2d_openmp(
     return result;
 }
 // #endif // _OPENMP
-std::vector<double> binary_correlation_2d_optimized_120x120(
+inline std::vector<double> binary_correlation_2d_optimized_120x120(
     const BEVType& A,  // Fixed at 120×120
     const BEVType& B,  // Smaller than A
     const std::vector<uint16_t>& lookup_table,
@@ -397,8 +399,7 @@ std::vector<double> binary_correlation_2d_optimized_120x120(
  * @param bev_image Input BEV image 2D array
  * @return Tuple containing cropped image, starting coordinates, and crop dimensions
  */
-BEVType //, std::pair<int, int>, std::pair<int, int>> 
-crop_to_minimum_bev(const BEVType& bev_image) {
+inline BEVType crop_to_minimum_bev(const BEVType& bev_image) {
     // Image dimension check
     if (bev_image.empty() || bev_image[0].empty()) {
         return BEVType();
@@ -467,7 +468,7 @@ crop_to_minimum_bev(const BEVType& bev_image) {
  * @param filepath Path to input file
  * @return Vector of position and rotation matrix pairs, where position is 3D vector and rotation is 3×3 matrix
  */
-std::vector<std::pair<Eigen::Vector3f, Eigen::Matrix3f>>
+inline std::vector<std::pair<Eigen::Vector3f, Eigen::Matrix3f>>
 load_poses_from_hfx(const std::string filepath) {
     double t, x, y, z, qx, qy, qz, qw;
     std::vector<std::pair<Eigen::Vector3f, Eigen::Matrix3f>> pose_vec;
@@ -502,7 +503,7 @@ load_poses_from_hfx(const std::string filepath) {
     return pose_vec;
 }
 
-void compute_adj_rpe(Eigen::Matrix4d& gt,
+inline void compute_adj_rpe(Eigen::Matrix4d& gt,
                      Eigen::Matrix4d& lo,
                      double& t_e,
                      double& r_e) {
@@ -516,7 +517,7 @@ void compute_adj_rpe(Eigen::Matrix4d& gt,
           M_PI * 180;
 }
 
-double time_inc(std::chrono::_V2::system_clock::time_point &t_end,
+inline double time_inc(std::chrono::_V2::system_clock::time_point &t_end,
                 std::chrono::_V2::system_clock::time_point &t_begin) {
   return std::chrono::duration_cast<std::chrono::duration<double>>(t_end -
                                                                    t_begin)
@@ -537,7 +538,7 @@ double time_inc(std::chrono::_V2::system_clock::time_point &t_end,
  * @return Pair containing start index and end index of zero region (end index not included)
  *         Returns {-1, -1} if no zero values found
  */
-std::pair<int, int> find_single_zero_region(const std::vector<float>& descriptor, float zero_threshold = 0.0f) 
+inline std::pair<int, int> find_single_zero_region(const std::vector<float>& descriptor, float zero_threshold = 0.0f) 
 {
     // Return directly if descriptor is empty
     if (descriptor.empty()) {
@@ -612,7 +613,7 @@ std::pair<int, int> find_single_zero_region(const std::vector<float>& descriptor
  * @param newtable Lookup table for similarity calculation
  * @return Similarity score vector
  */
-std::vector<float> complete_similarity(const CLDType& b, 
+inline std::vector<float> complete_similarity(const CLDType& b, 
                                       const CLDType& a,
                                       const std::vector<int>& newtable,
                                       int& query_size,
@@ -711,7 +712,7 @@ std::vector<float> complete_similarity(const CLDType& b,
  * @param min_points_per_sector Minimum number of point clouds
  * @return Sector feature descriptor
  */
-CLDType generate_cld_my(const pcl::PointCloud<pcl::PointXYZ>::Ptr point_cloud, 
+inline CLDType generate_cld_my(const pcl::PointCloud<pcl::PointXYZ>::Ptr point_cloud, 
                                                 int num_sectors = 24, 
                                                 float max_range = 50.0f, 
                                                 int min_points_per_sector = 3) {
@@ -852,7 +853,7 @@ using PoseVector = std::vector<Pose>;
  * @param query_pose Query pose
  * @return Index and distance of nearest pose
  */
-float findNearestPosePosition(
+inline float findNearestPosePosition(
     const PoseVector& poses,
     const Pose& query_pose) {
     
@@ -876,7 +877,7 @@ float findNearestPosePosition(
     return min_dist;
 }
 
-double computeOverlapFast(
+inline double computeOverlapFast(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& small_cloud,
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& large_cloud,
     float distance_threshold = 0.05,

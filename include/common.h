@@ -292,6 +292,10 @@ struct OdometryParams
     int intra_icp_iterations_time_;
     float inter_icp_max_correspondence_distance_;
     int inter_icp_iterations_time_;
+    // multi-sector / loop candidate tuning (kept for compatibility)
+    int candidates_num_ = 6;
+    float distance_threshold_ = 0.14f;
+    int exclude_recent_num_ = 100;
     // overlap verification (for loop closure geometric check)
     double overlap_distance_threshold_ = 2.0; // meters
     double overlap_voxel_size_ = 0.1;         // downsample voxel for overlap

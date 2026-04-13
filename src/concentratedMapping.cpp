@@ -294,9 +294,19 @@ public:
         }
         else if (params.descriptor_type_ == DescriptorType::MultiSector)
         {
+            // New MultiSectorDescriptor signature:
+            // MultiSectorDescriptor(int sector_num, float max_range, int min_points,
+            //                       int candidates_num, float distance_threshold,
+            //                       int exclude_recent, std::string directory)
             scan_descriptor = unique_ptr<ScanDescriptor>(new MultiSectorDescriptor(
-                80, 360, params.n_scan_, params.distance_threshold_, params.exclude_recent_num_,
-                2, params.candidates_num_, 4, 18, 1.6f, 0.75f, params.save_directory_));
+                24,                      // sector_num
+                params.max_radius_,      // max_range
+                3,                       // min_points (per sector)
+                params.candidates_num_,  // candidates_num
+                params.distance_threshold_, // distance_threshold
+                params.exclude_recent_num_, // exclude_recent
+                params.save_directory_      // directory
+            ));
         }
 
         /* global robust optimizer */
@@ -382,7 +392,7 @@ public:
         }
     }
 
-    void sendLoopClosureStageOne(
+    void sendLoopClosureStageOne( 
         const int8_t& robot0,
         const int& key0,
         const int8_t& robot1,
@@ -589,15 +599,15 @@ public:
         serializer.deserialize_message(serialized_msg.get(), &msg);
 
         auto robot_id = msg.robot_id;
-        if (prefix.find(robot_id) == prefix.end())
+        if (prefix.find(robot_id) == prefix.end())  //如果机器人每出现过，创建容器并初始化相关信息
         {
             allocateMemoryAndInitialization(robot_id);
-            optimizer->addRobot(robot_id);
+            optimizer->addRobot(robot_id); //将机器人加入因子图 
         }
         
         system_monitor->addReceviedMsg(serialized_msg->size(), true);
 
-        SwarmFrame sf(msg, imu_odometry_queue, trans_to_pub);
+        SwarmFrame sf(msg, imu_odometry_queue, trans_to_pub); // 把优化请求消息、IMU里程计队列和相对变换传给 SwarmFrame，后者会根据这些信息构建出一个“包含当前优化所需全部信息的对象 sf”。
         
         auto start_optimize_time = chrono::high_resolution_clock::now();
         optimizer->optimize(sf, loop_indexes);
@@ -608,7 +618,7 @@ public:
         if (sf.do_optimize)
         {
             RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mcorrectPoses\033[0m");
-            correctPoses(robot_id, sf.timestamp, optimizer->getLatestValues(robot_id));
+            correctPoses(robot_id, sf.timestamp, optimizer->getLatestValues(robot_id));  //修正位姿 
         }
 
         if (sf.isOdom)
@@ -1108,3 +1118,6 @@ int main(
 
     return 0;
 }
+
+//如果我禁用uwb，什么时候触发跨机器人回环检测？
+//

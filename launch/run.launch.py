@@ -11,7 +11,7 @@ def generate_launch_description():
 
 	ld = LaunchDescription()
 
-	parameters_file_path = os.path.join(get_package_share_directory('co_lrio'), 'config', 'graco.yaml')
+	parameters_file_path = os.path.join(get_package_share_directory('co_lrio'), 'config', 'co_lrio_params_msol.yaml')
 	xacro_path = os.path.join(get_package_share_directory('co_lrio'), 'config', 'robot.urdf.xacro')
 
 	# Set env var to print message to stdout immediately
