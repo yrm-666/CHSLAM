@@ -486,7 +486,14 @@ public:
         auto x = 0.0, y = 0.0, z = 0.0;
         if (use_odom_undistort)
         {
-            auto ratio = (p_time - start_time)/(end_time - start_time);
+            const auto duration = end_time - start_time;
+            double ratio = 0.0;
+            if (std::abs(duration) > 1e-6)
+            {
+                ratio = (p_time - start_time) / duration;
+            }
+            if (ratio < 0.0) ratio = 0.0;
+            if (ratio > 1.0) ratio = 1.0;
             x = ratio*incre_odom_undistort.translation().x();
             y = ratio*incre_odom_undistort.translation().y();
             z = ratio*incre_odom_undistort.translation().z();
@@ -802,8 +809,8 @@ public:
         }
         else
         {
-            scan_out->resize(scan_in->points.size());
-            #pragma omp parallel for num_threads(params.number_of_cores_)
+            scan_out->clear();
+            scan_out->reserve(scan_in->points.size());
             for (int i = 0; i < scan_in->points.size(); i++)
             {
                 auto p = scan_in->points[i];
@@ -832,7 +839,11 @@ public:
                 undistort_p2.y = undistort_p.y;
                 undistort_p2.z = undistort_p.z;
                 undistort_p2.intensity = undistort_p.intensity;
-                scan_out->points[i] = undistort_p2;
+                if (!std::isfinite(undistort_p2.x) || !std::isfinite(undistort_p2.y) || !std::isfinite(undistort_p2.z))
+                {
+                    continue;
+                }
+                scan_out->push_back(undistort_p2);
             }
         }
 
@@ -1024,8 +1035,8 @@ public:
         if (vel.norm() > 30 || ba.norm() > 1.0 || bg.norm() > 1.0)
         {
             RCLCPP_WARN(rclcpp::get_logger("preintegration"), "\033[1;36m%s Reset imu preintegration!\033[0m", params.name_.c_str());
-            // preintegrator_time = -1;
-            // system_initialized = false;
+            preintegrator_time = -1;
+            system_initialized = false;
         }
     }
 

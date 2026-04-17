@@ -2723,7 +2723,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 255; 255; 255
-    Fixed Frame: robot_0/base_enu
+    Fixed Frame: robot_0/odom
     Frame Rate: 5
   Name: root
   Tools:

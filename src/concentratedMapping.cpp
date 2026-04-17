@@ -4,7 +4,7 @@
 #include "robustOptimizer.h"
 #include "co_lrio/srv/save_files.hpp"
 #include <rclcpp/serialization.hpp>
-// #include <sys/stat.h>  // for mkdir
+#include <filesystem>
 
 
 namespace co_lrio
@@ -160,7 +160,7 @@ public:
         {
             params.descriptor_type_ = DescriptorType::LidarIris;
         }
-        else if (descriptor_type == "MultiSector")
+        else if (descriptor_type == "MSOLDescriptor")
         {
             params.descriptor_type_ = DescriptorType::MultiSector;
         }
@@ -299,13 +299,13 @@ public:
             //                       int candidates_num, float distance_threshold,
             //                       int exclude_recent, std::string directory)
             scan_descriptor = unique_ptr<ScanDescriptor>(new MultiSectorDescriptor(
-                24,                      // sector_num
-                params.max_radius_,      // max_range
-                3,                       // min_points (per sector)
-                params.candidates_num_,  // candidates_num
-                params.distance_threshold_, // distance_threshold
-                params.exclude_recent_num_, // exclude_recent
-                params.save_directory_      // directory
+                20,                          // ring_num
+                24,                          // sector_num
+                params.candidates_num_,      // candidates_num
+                params.distance_threshold_,  // distance_threshold
+                params.max_radius_,          // max_radius
+                params.exclude_recent_num_,  // exclude_recent_num
+                params.save_directory_       // directory
             ));
         }
 
@@ -361,15 +361,26 @@ public:
     void performInterLoopClosure()  //执行一次回环检测 
     {
         // early return
-        if (inter_robot_loop_ptr >= scan_descriptor->getSize())     //越界保护  scan_descriptor->getSize()为描述子的索引大小  
+        if (inter_robot_loop_ptr >= scan_descriptor->getSize())     //越界保护  scan_descriptor->getSize()为描述子的索引大小
         {
             return;
         }
 
+        // periodic status log — every 100 frames print descriptor pool size
+        if (inter_robot_loop_ptr % 100 == 0)
+        {
+            RCLCPP_INFO(rclcpp::get_logger("loop_log"),
+                "[LoopDetect] ptr=%d  descriptor_pool=%d",
+                inter_robot_loop_ptr, scan_descriptor->getSize());
+        }
+
         // detect inter-robot and intra-robot loop closure
-        auto robot_key = scan_descriptor->getIndex(inter_robot_loop_ptr);   //获取当前回环检测的机器人和关键帧索引，返回值为一个pair，first为机器人id，second为关键帧索引
-        auto candidates = scan_descriptor->detectLoopClosure(robot_key.first, robot_key.second); //当前查询到的机器人进行回环检测，并将候选存入candidates中
+        auto robot_key = scan_descriptor->getIndex(inter_robot_loop_ptr);
+        auto candidates = scan_descriptor->detectLoopClosure(robot_key.first, robot_key.second);
         RCLCPP_DEBUG(rclcpp::get_logger("loop_log"), "performInterLoopClosure %d/%d", inter_robot_loop_ptr, scan_descriptor->getSize());
+        RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+            "[LoopDetect] query=[%d-%d] candidates=%zu enable_loop=%d",
+            robot_key.first, robot_key.second, candidates.size(), params.enable_loop_ ? 1 : 0);
         inter_robot_loop_ptr++;
 
         // no loop closure candidate 
@@ -382,6 +393,9 @@ public:
         {
             if (!params.enable_loop_ && robot_key.first!=get<0>(candidate)) // 如果外回环检测被禁用，并且候选项是异机器人回环，则跳过该候选项
             {
+                RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+                    "[LoopDetect] skip inter-robot candidate [%d-%d]->[%d-%d], enable_loop=false",
+                    robot_key.first, robot_key.second, get<0>(candidate), get<1>(candidate));
                 continue;
             }
             
@@ -621,6 +635,10 @@ public:
             correctPoses(robot_id, sf.timestamp, optimizer->getLatestValues(robot_id));  //修正位姿 
         }
 
+        RCLCPP_INFO(rclcpp::get_logger("loop_log"),
+            "[DescSave] robot=%d key=%d isOdom=%d desc_size=%zu pool=%d",
+            (int)sf.robot_id, sf.robot_key, (int)sf.isOdom,
+            sf.descriptor.size(), scan_descriptor->getSize());
         if (sf.isOdom)
         {
             // save map and pose
@@ -970,6 +988,7 @@ public:
         const std::shared_ptr<co_lrio::srv::SaveFiles::Request> req,
         std::shared_ptr<co_lrio::srv::SaveFiles::Response> res)
     {
+        res->success = false;
         // directory
         RCLCPP_INFO(rclcpp::get_logger(""), "Saving trajectories to files...");
         std::string directory;
@@ -988,6 +1007,14 @@ public:
             // }
         }
         RCLCPP_INFO(rclcpp::get_logger(""), "Save directory: %s", directory.c_str());
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        if (ec)
+        {
+            RCLCPP_ERROR(rclcpp::get_logger(""), "Failed to create save directory '%s': %s",
+                directory.c_str(), ec.message().c_str());
+            return;
+        }
 
         // extract trajectory and map of each robot
         RCLCPP_INFO(rclcpp::get_logger(""), "Extracting trajectories");
@@ -1046,6 +1073,11 @@ public:
         {
             std::ofstream tum_file;
             tum_file.open(directory + "/" + prefix.at(poses_6d_info.first) + "_tum_trajectory.txt");
+            if (!tum_file.is_open())
+            {
+                RCLCPP_ERROR(rclcpp::get_logger(""), "Failed to open trajectory file for robot %d", poses_6d_info.first);
+                return;
+            }
             tum_file.setf(ios::fixed);
             tum_file.precision(10);
 
@@ -1070,14 +1102,52 @@ public:
         
         // save global maps pcd
         RCLCPP_INFO(rclcpp::get_logger(""), "Saving maps");
-        pcl::PointCloud<PointPose3D>::Ptr globalMapDS(new pcl::PointCloud<PointPose3D>());
-        pcl::VoxelGrid<PointPose3D> downSizeFilterPcdMap;
-        downSizeFilterPcdMap.setLeafSize(0.2, 0.2, 0.2);
         for (const auto& global_maps_info : global_maps)
         {
-            downSizeFilterPcdMap.setInputCloud(global_maps.at(global_maps_info.first));
-            downSizeFilterPcdMap.filter(*globalMapDS);
-            pcl::io::savePCDFileBinary(directory + "/" + prefix.at(global_maps_info.first) + "_map.pcd", *globalMapDS);
+            pcl::PointCloud<PointPose3D>::Ptr input_map(new pcl::PointCloud<PointPose3D>());
+            *input_map = *global_maps.at(global_maps_info.first);
+            static std::vector<int> valid_indices;
+            pcl::removeNaNFromPointCloud(*input_map, *input_map, valid_indices);
+            if (input_map->empty())
+            {
+                RCLCPP_WARN(rclcpp::get_logger(""), "Robot %d map is empty after filtering, skip saving pcd", global_maps_info.first);
+                continue;
+            }
+
+            pcl::PointCloud<PointPose3D>::Ptr globalMapDS(new pcl::PointCloud<PointPose3D>());
+            float leaf = 0.2f;
+            bool filtered_ok = false;
+            for (int retry = 0; retry < 4; ++retry)
+            {
+                try
+                {
+                    pcl::VoxelGrid<PointPose3D> downSizeFilterPcdMap;
+                    downSizeFilterPcdMap.setLeafSize(leaf, leaf, leaf);
+                    downSizeFilterPcdMap.setInputCloud(input_map);
+                    downSizeFilterPcdMap.filter(*globalMapDS);
+                    filtered_ok = true;
+                    break;
+                }
+                catch (const std::exception& e)
+                {
+                    RCLCPP_WARN(rclcpp::get_logger(""), "VoxelGrid failed (leaf=%.3f): %s. Retrying with larger leaf.",
+                        leaf, e.what());
+                    leaf *= 2.0f;
+                }
+            }
+            if (!filtered_ok || globalMapDS->empty())
+            {
+                RCLCPP_WARN(rclcpp::get_logger(""), "Robot %d downsample failed/empty, save raw map instead", global_maps_info.first);
+                globalMapDS = input_map;
+            }
+
+            const auto map_path = directory + "/" + prefix.at(global_maps_info.first) + "_map.pcd";
+            const int ret = pcl::io::savePCDFileBinary(map_path, *globalMapDS);
+            if (ret != 0)
+            {
+                RCLCPP_ERROR(rclcpp::get_logger(""), "Failed to save map file: %s (ret=%d)", map_path.c_str(), ret);
+                return;
+            }
         }
 
         RCLCPP_INFO(rclcpp::get_logger(""), "Saving trajectories and maps to files completed.");

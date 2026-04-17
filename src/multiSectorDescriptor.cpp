@@ -249,8 +249,9 @@ std::vector<std::tuple<int8_t, int, int>> MultiSectorDescriptor::detectLoopClosu
         if (idx < 0) continue;
         if (idx >= static_cast<int>(new_local_to_global_maps.size())) continue;
         int global_idx = new_local_to_global_maps[idx]; // 从局部索引恢复全局索引
+        if (global_idx == query_global) continue;  // 排除自匹配
         auto itdb = cld_db_.find(global_idx); //
-        if (itdb == cld_db_.end()) continue;  
+        if (itdb == cld_db_.end()) continue;
         CLDType candidate_cld = itdb->second;  //描述子矩阵 
 
         int qsize = 0, off = 0, zlen = 0;

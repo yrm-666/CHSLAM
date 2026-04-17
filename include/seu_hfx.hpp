@@ -882,6 +882,9 @@ inline double computeOverlapFast(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& large_cloud,
     float distance_threshold = 0.05,
     float voxel_size = 0.1) {
+    if (!small_cloud || !large_cloud || small_cloud->empty() || large_cloud->empty()) {
+        return 0.0;
+    }
     
     pcl::PointCloud<pcl::PointXYZ>::Ptr small_filtered(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::PointCloud<pcl::PointXYZ>::Ptr large_filtered(new pcl::PointCloud<pcl::PointXYZ>);
@@ -901,6 +904,10 @@ inline double computeOverlapFast(
         small_filtered = small_cloud;
         large_filtered = large_cloud;
     }
+
+    if (small_filtered->empty() || large_filtered->empty()) {
+        return 0.0;
+    }
     
     // Build KD tree (using large point cloud)
     pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
@@ -912,6 +919,9 @@ inline double computeOverlapFast(
     // Statistics variables
     int overlap_count = 0;
     const int small_cloud_size = small_filtered->size();
+    if (small_cloud_size == 0) {
+        return 0.0;
+    }
     
     // Parallel processing for efficiency
     #pragma omp parallel

@@ -4,6 +4,7 @@
 #include <gicp/so3/so3.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <pcl/features/normal_3d_omp.h>
+#include <cmath>
 
 namespace fast_gicp {
 
@@ -77,10 +78,12 @@ void FastGICP<PointSource, PointTarget>::clearTarget() {
 
 template <typename PointSource, typename PointTarget>
 void FastGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceConstPtr& cloud) {
-  if (input_ == cloud) {
+  if (!cloud || cloud->empty()) {
+    pcl::Registration<PointSource, PointTarget, Scalar>::setInputSource(cloud);
+    source_covs_.clear();
+    use_ic = false;
     return;
   }
-
   pcl::Registration<PointSource, PointTarget, Scalar>::setInputSource(cloud);
   source_kdtree_->setInputCloud(cloud);
   source_covs_.clear();
@@ -89,7 +92,11 @@ void FastGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceCo
 
 template <typename PointSource, typename PointTarget>
 void FastGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceConstPtr& cloud, const Eigen::Matrix4d& guess) {
-  if (input_ == cloud) {
+  if (!cloud || cloud->empty()) {
+    pcl::Registration<PointSource, PointTarget, Scalar>::setInputSource(cloud);
+    source_covs_.clear();
+    R_guess = guess;
+    use_ic = true;
     return;
   }
   pcl::Registration<PointSource, PointTarget, Scalar>::setInputSource(cloud);
@@ -108,10 +115,12 @@ void FastGICP<PointSource, PointTarget>::setInputSourceWithIkdTree(const PointCl
 
 template <typename PointSource, typename PointTarget>
 void FastGICP<PointSource, PointTarget>::setInputTarget(const PointCloudTargetConstPtr& cloud) {
-  if (target_ == cloud) {
+  if (!cloud || cloud->empty()) {
+    pcl::Registration<PointSource, PointTarget, Scalar>::setInputTarget(cloud);
+    target_covs_.clear();
+    correspondences_flag_.clear();
     return;
   }
-  
   pcl::Registration<PointSource, PointTarget, Scalar>::setInputTarget(cloud);
   target_kdtree_->setInputCloud(cloud);
   if (target_covs_.size() != target_->size())
@@ -142,6 +151,22 @@ void FastGICP<PointSource, PointTarget>::setTargetCovariances(const std::vector<
 
 template <typename PointSource, typename PointTarget>
 void FastGICP<PointSource, PointTarget>::computeTransformation(PointCloudSource& output, const Matrix4& guess) {
+  if (!input_ || !target_ || input_->empty() || target_->empty()) {
+    if (input_) {
+      output = *input_;
+    } else {
+      output.clear();
+    }
+    this->final_transformation_ = guess;
+    this->converged_ = false;
+    return;
+  }
+  if (input_->size() < 5 || target_->size() < 5) {
+    output = *input_;
+    this->final_transformation_ = guess;
+    this->converged_ = false;
+    return;
+  }
   if (source_ikdtree_ == nullptr)
   {
     if (source_covs_.size() != input_->size()) {
@@ -194,13 +219,17 @@ void FastGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
       std::vector<int> k_indices2(3);
       std::vector<float> k_sq_dists2(3);
 
-      target_kdtree_->nearestKSearch(pt, 3, k_indices2, k_sq_dists2);
+      const int found = target_kdtree_->nearestKSearch(pt, 3, k_indices2, k_sq_dists2);
+      if (found <= 0) {
+        correspondences_[i] = -1;
+        continue;
+      }
 
       int min_indice = -1;
       float min_dis = 100000.0;
-      for (int k = 0; k < k_indices2.size(); k++)
+      for (int k = 0; k < found; k++)
       {
-        if (k_indices2[k] < 0 || k_indices2[k] > target_->size())
+        if (k_indices2[k] < 0 || k_indices2[k] >= target_->size())
         {
           continue;
         }
@@ -215,6 +244,10 @@ void FastGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
         }
       }
 
+      if (min_indice < 0 || min_indice >= found) {
+        correspondences_[i] = -1;
+        continue;
+      }
       correspondences_[i] = k_sq_dists2[min_indice] < corr_dist_threshold_ * corr_dist_threshold_ ? k_indices2[min_indice] : -1;
     }
     else
@@ -222,12 +255,16 @@ void FastGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
       std::vector<int> k_indices(1);
       std::vector<float> k_sq_dists(1);
 
-      target_kdtree_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+      const int found = target_kdtree_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+      if (found <= 0 || k_indices.empty() || k_sq_dists.empty()) {
+        correspondences_[i] = -1;
+        continue;
+      }
       
       correspondences_[i] = k_sq_dists[0] < corr_dist_threshold_ * corr_dist_threshold_ ? k_indices[0] : -1;
     }
 
-    if (correspondences_[i] < 0 || correspondences_[i] > target_->size()) {
+    if (correspondences_[i] < 0 || correspondences_[i] >= target_->size()) {
       correspondences_[i] = -1;
       continue;
     }
@@ -399,13 +436,24 @@ bool FastGICP<PointSource, PointTarget>::calculate_covariances(
   const typename pcl::PointCloud<PointT>::ConstPtr& cloud,
   pcl::search::KdTree<PointT>& kdtree,
   std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>& covariances) {
-  if (kdtree.getInputCloud() != cloud) {
-    kdtree.setInputCloud(cloud);
+  if (!cloud || cloud->empty()) {
+    covariances.clear();
+    return false;
   }
+  // Always rebuild to ensure FLANN index matches current cloud contents,
+  // even when the shared_ptr address hasn't changed but data has.
+  kdtree.setInputCloud(cloud);
   covariances.resize(cloud->size());
 
   #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
   for (int i = 0; i < cloud->size(); i++) {
+    covariances[i].setZero();
+    covariances[i](3, 3) = 1.0;
+    const auto& query = cloud->at(i);
+    if (!std::isfinite(query.x) || !std::isfinite(query.y) || !std::isfinite(query.z)) {
+      continue;
+    }
+
     std::vector<int> k_indices;
     std::vector<float> k_sq_distances;
     std::vector<int> k_indices2;
@@ -413,15 +461,30 @@ bool FastGICP<PointSource, PointTarget>::calculate_covariances(
     std::vector<int> k_indices3;
     std::vector<float> k_sq_distances3;
 
-    kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
-
-    Eigen::Matrix<double, 4, -1> neighbors(4, k_correspondences_);
-    for (int j = 0; j < k_indices.size(); j++) {
-      neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap().template cast<double>();
+    const int found = kdtree.nearestKSearch(query, k_correspondences_, k_indices, k_sq_distances);
+    if (found <= 0 || k_indices.empty()) {
+      continue;
     }
 
+    Eigen::Matrix<double, 4, -1> neighbors(4, found);
+    int valid_count = 0;
+    for (int j = 0; j < found; j++) {
+      if (k_indices[j] < 0 || k_indices[j] >= cloud->size()) {
+        continue;
+      }
+      const auto& npt = cloud->at(k_indices[j]);
+      if (!std::isfinite(npt.x) || !std::isfinite(npt.y) || !std::isfinite(npt.z)) {
+        continue;
+      }
+      neighbors.col(valid_count++) = npt.getVector4fMap().template cast<double>();
+    }
+    if (valid_count < 3) {
+      continue;
+    }
+    neighbors.conservativeResize(Eigen::NoChange, valid_count);
+
     neighbors.colwise() -= neighbors.rowwise().mean().eval();
-    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / k_correspondences_;
+    Eigen::Matrix4d cov = neighbors * neighbors.transpose() / valid_count;
 
     if (regularization_method_ == RegularizationMethod::NONE) {
       covariances[i] = cov;

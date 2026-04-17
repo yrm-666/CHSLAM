@@ -50,6 +50,7 @@ private:
     // mutex
     std::mutex lock_on_imu;
     std::mutex lock_on_scan;
+    std::mutex lock_on_loop_closure;
 
     // queue
     std::deque<sensor_msgs::msg::PointCloud2> cloud_queue;
@@ -80,6 +81,7 @@ private:
     pcl::VoxelGrid<PointPose3D> voxel_grid;
     pcl::PointCloud<PointPose3D>::Ptr source_cloud;
     pcl::PointCloud<PointPose3D>::Ptr target_cloud;
+    bool gicp_target_ready = false;
 
     // odometry
     bool first_scan;
@@ -210,7 +212,15 @@ public:
         this->get_parameter("imu_topic", params.imu_topic_);
         this->declare_parameter("imu_frequency", 100.0f);
         this->get_parameter("imu_frequency", params.imu_frequency_);
-        params.imu_frequency_ = 1.0/params.imu_frequency_;
+        if (params.imu_frequency_ <= 0.0f)
+        {
+            RCLCPP_WARN(
+                rclcpp::get_logger(""),
+                "Invalid imu_frequency (%.3f). Fallback to 100Hz.",
+                params.imu_frequency_);
+            params.imu_frequency_ = 100.0f;
+        }
+        params.imu_frequency_ = 1.0 / params.imu_frequency_;
         this->declare_parameter("imu_acc_noise", 0.01);
         this->get_parameter("imu_acc_noise", params.imu_acc_noise_);
         this->declare_parameter("imu_gyr_noise", 0.001);
@@ -224,7 +234,19 @@ public:
         // extrinsics
         this->declare_parameter("extrinsic_l2i", vector<double>());
         this->get_parameter("extrinsic_l2i", params.extrinsic_vec_);
-        params.extrinsic_mat_ = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(params.extrinsic_vec_.data(), 4, 4);
+        if (params.extrinsic_vec_.size() != 16)
+        {
+            RCLCPP_WARN(
+                rclcpp::get_logger(""),
+                "Parameter extrinsic_l2i size is %zu (expect 16). Use identity matrix. Please set robot-specific extrinsic_l2i.",
+                params.extrinsic_vec_.size());
+            params.extrinsic_mat_ = Eigen::Matrix4d::Identity();
+        }
+        else
+        {
+            params.extrinsic_mat_ = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::RowMajor>>(
+                params.extrinsic_vec_.data());
+        }
         params.extrinsic_qrpy_ = Eigen::Quaterniond(params.extrinsic_mat_.topLeftCorner<3,3>()).inverse();
 
         // UWB settings
@@ -232,7 +254,15 @@ public:
         this->get_parameter("uwb_topic", params.uwb_topic_);
         this->declare_parameter("uwb_frequency", 200.0f);
         this->get_parameter("uwb_frequency", params.uwb_frequency_);
-        params.uwb_frequency_ = 1.0/params.uwb_frequency_;
+        if (params.uwb_frequency_ <= 0.0f)
+        {
+            RCLCPP_WARN(
+                rclcpp::get_logger(""),
+                "Invalid uwb_frequency (%.3f). Fallback to 200Hz.",
+                params.uwb_frequency_);
+            params.uwb_frequency_ = 200.0f;
+        }
+        params.uwb_frequency_ = 1.0 / params.uwb_frequency_;
 
         // GPS Setting
         this->declare_parameter("use_gnss", false);
@@ -475,13 +505,13 @@ public:
         else if (params.descriptor_type_ == DescriptorType::MultiSector)
         {
             scan_descriptor = std::unique_ptr<ScanDescriptor>(new MultiSectorDescriptor(
-                24,                    // sector_num
-                params.max_radius_,    // max_range
-                3,                     // min_points (per sector)
-                params.candidates_num_,// candidates_num
-                params.distance_threshold_, // distance_threshold
-                params.exclude_recent_num_, // exclude_recent
-                ""                   // directory (empty for runtime)
+                20,                          // ring_num
+                24,                          // sector_num
+                params.candidates_num_,      // candidates_num
+                params.distance_threshold_,  // distance_threshold
+                params.max_radius_,          // max_radius
+                params.exclude_recent_num_,  // exclude_recent_num
+                ""                           // directory (empty for runtime)
             ));
         }
         else
@@ -657,16 +687,38 @@ public:
             // downsample scan
             voxel_grid.setInputCloud(sim_scan);
             voxel_grid.filter(*source_cloud);
+            static vector<int> source_indices;
+            pcl::removeNaNFromPointCloud(*source_cloud, *source_cloud, source_indices);
         }
         else if (params.sensor_ == LiDARType::VELODYNE || params.sensor_ == LiDARType::LIVOX)
         {
-            pcl::fromROSMsg(cloud_msg, *scan);
+            // Check if cloud has ring field; if not (e.g. LIVOX or PointXYZI velodyne), synthesize ring/time
+            bool has_ring = false;
+            for (const auto& f : cloud_msg.fields)
+                if (f.name == "ring") { has_ring = true; break; }
+
+            if (!has_ring) {
+                convertLivoxToXYZIRT(cloud_msg, scan);
+            } else {
+                pcl::fromROSMsg(cloud_msg, *scan);
+            }
+
+            // Check if cloud is empty
+            if (scan->points.size() == 0) {
+                RCLCPP_WARN(rclcpp::get_logger("odometry"), "Empty point cloud received!");
+                return;
+            }
 
             // get timestamp
             scan_header = cloud_msg.header;
             scan_time = rosTime(scan_header.stamp);
-            scan_start_time = rosTime(scan_header.stamp) + scan->points.front().time;
-            scan_end_time = rosTime(scan_header.stamp) + scan->points.back().time;
+            if (scan->points.size() > 0) {
+                scan_start_time = rosTime(scan_header.stamp) + scan->points.front().time;
+                scan_end_time = rosTime(scan_header.stamp) + scan->points.back().time;
+            } else {
+                scan_start_time = scan_time;
+                scan_end_time = scan_time;
+            }
 
             // remove nan
             static vector<int> indices;
@@ -683,8 +735,28 @@ public:
                 last_pose = current_pose;
             current_pose = result.second;
             // downsample scan
-            voxel_grid.setInputCloud(result.first);
+            pcl::PointCloud<PointPose3D>::Ptr scan_for_downsample = result.first;
+            if (!scan_for_downsample || scan_for_downsample->empty())
+            {
+                // Livox fallback: if undistortion degenerates (e.g. invalid per-point timing),
+                // keep raw converted scan to avoid dropping the whole frame.
+                pcl::PointCloud<PointPose3D>::Ptr fallback_scan(new pcl::PointCloud<PointPose3D>());
+                fallback_scan->reserve(scan->size());
+                for (const auto& p : scan->points)
+                {
+                    PointPose3D q;
+                    q.x = p.x;
+                    q.y = p.y;
+                    q.z = p.z;
+                    q.intensity = p.intensity;
+                    fallback_scan->push_back(q);
+                }
+                scan_for_downsample = fallback_scan;
+            }
+            voxel_grid.setInputCloud(scan_for_downsample);
             voxel_grid.filter(*source_cloud);
+            static vector<int> source_indices;
+            pcl::removeNaNFromPointCloud(*source_cloud, *source_cloud, source_indices);
         }
         else
         {
@@ -692,6 +764,17 @@ public:
             rclcpp::shutdown();
         }
         auto end_undistort_time = chrono::high_resolution_clock::now();
+
+        if (source_cloud->empty())
+        {
+            RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s source cloud empty after preprocessing, skip frame.", params.name_.c_str());
+            return;
+        }
+        if (source_cloud->size() < 20)
+        {
+            RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s source cloud too small (%zu), skip frame.", params.name_.c_str(), source_cloud->size());
+            return;
+        }
 
         /*** scan matching ***/
         if (first_scan)
@@ -747,6 +830,11 @@ public:
             // build sub-map
             if (params.use_ikd_tree_)
             {
+                if (source_cloud->empty())
+                {
+                    RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s first scan source cloud empty, skip.", params.name_.c_str());
+                    return;
+                }
                 KD_TREE<PointPose3D>::PointVector point_vec_cloud;
                 point_vec_cloud.resize(source_cloud->points.size());
                 for (int i = 0; i < int(source_cloud->points.size()); i++)
@@ -757,14 +845,21 @@ public:
                 ikd_tree->Build(point_vec_cloud);
                 gicp.clearTarget();
                 gicp.setInputTargetWithIkdTree(source_cloud, ikd_tree);
+                gicp_target_ready = true;
                 auto end_build_time = chrono::high_resolution_clock::now();
                 auto build_duration = chrono::duration_cast<chrono::microseconds>(end_build_time-end_undistort_time).count();
                 RCLCPP_INFO(rclcpp::get_logger("odometry"), "\033[1;31m--->ikd tree build: %d points in %fms.\033[0m", point_vec_cloud.size(), float(build_duration)/1e3);
             }
             else
             {
+                if (source_cloud->empty())
+                {
+                    RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s first scan source cloud empty, skip.", params.name_.c_str());
+                    return;
+                }
                 gicp.clearTarget();
                 gicp.setInputTarget(source_cloud);
+                gicp_target_ready = true;
             }
 
             // initialize imu preintergration
@@ -791,6 +886,16 @@ public:
             auto start_scan2map_time = chrono::high_resolution_clock::now();
             // align clouds
             pcl::PointCloud<PointPose3D>::Ptr unused_result(new pcl::PointCloud<PointPose3D>);
+            if (source_cloud->empty())
+            {
+                RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s source cloud empty before scan2map, skip.", params.name_.c_str());
+                return;
+            }
+            if (!gicp_target_ready)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s GICP target not ready, skip frame.", params.name_.c_str());
+                return;
+            }
             if (params.use_ikd_tree_)
             {
                 std::shared_ptr<KD_TREE<PointPose3D>> ikd_tree_source;
@@ -926,6 +1031,38 @@ public:
         }
     }
 
+    // Convert Livox point cloud (PointXYZI) to PointXYZIRT format
+    void convertLivoxToXYZIRT(
+        const sensor_msgs::msg::PointCloud2& cloud_msg,
+        pcl::PointCloud<PointXYZIRT>::Ptr& scan_out)
+    {
+        // Extract PointXYZI from ROS message
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_xyzi(new pcl::PointCloud<pcl::PointXYZI>());
+        try {
+            pcl::fromROSMsg(cloud_msg, *cloud_xyzi);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger(""), "Failed to convert Livox cloud: %s", e.what());
+            return;
+        }
+
+        // Convert to PointXYZIRT with default ring and time
+        scan_out->clear();
+        scan_out->reserve(cloud_xyzi->size());
+        const float n = static_cast<float>(std::max<size_t>(1, cloud_xyzi->size()));
+        for (size_t i = 0; i < cloud_xyzi->size(); ++i) {
+            const auto& pt = cloud_xyzi->points[i];
+            PointXYZIRT point;
+            point.x = pt.x;
+            point.y = pt.y;
+            point.z = pt.z;
+            point.intensity = pt.intensity;
+            point.ring = 0;  // Livox is single-return, no rings
+            // Synthetic in-frame relative time [0, 0.1s], needed by undistortion path.
+            point.time = 0.1f * (static_cast<float>(i) / n);
+            scan_out->push_back(point);
+        }
+    }
+
     ImuMeasurement transform_imu(
         const sensor_msgs::msg::Imu::SharedPtr imu_in)
     {
@@ -980,6 +1117,7 @@ public:
             tf2::Stamped<tf2::Transform> temp_trans(trans_odom_to_lidar*trans_lidar_2_base, tf2_ros::fromMsg(this->get_clock()->now()), params.name_ + params.odometry_frame_);
             geometry_msgs::msg::TransformStamped trans_odom_to_base_msg;
             tf2::convert(temp_trans, trans_odom_to_base_msg);
+            trans_odom_to_base_msg.header.frame_id = params.name_ + params.odometry_frame_;
             trans_odom_to_base_msg.child_frame_id = params.name_ + params.baselink_frame_;
             lidar_2_base_broadcaster->sendTransform(trans_odom_to_base_msg);
         }
@@ -1060,6 +1198,10 @@ public:
                 msg.pose_to.pose.pose.position.x,
                 msg.pose_to.pose.pose.position.y,
                 msg.pose_to.pose.pose.position.z));
+        if (index >= keyposes.size())
+        {
+            keyposes.resize(index + 1, optimized_keypose);
+        }
         keyposes[index] = optimized_keypose;
         RCLCPP_DEBUG(rclcpp::get_logger("odometry"), "\033[1;34mRobot<%s>--->optimized_keypose %f %f %f.\033[0m",
             params.name_.c_str(), optimized_keypose.translation().x(), optimized_keypose.translation().y(), optimized_keypose.translation().z());
@@ -1074,7 +1216,11 @@ public:
         keypose_point.y = optimized_keypose.translation().y();
         keypose_point.z = optimized_keypose.translation().z();
         keypose_point.intensity = index;
-        keyposes_cloud->push_back(keypose_point);
+        if (index >= keyposes_cloud->size())
+        {
+            keyposes_cloud->resize(index + 1);
+        }
+        keyposes_cloud->points[index] = keypose_point;
 
         if (index != 0)
         {
@@ -1098,14 +1244,25 @@ public:
             pcl::fromROSMsg(msg.keyposes, *optimized_keyposes);
             for (const auto& p : optimized_keyposes->points)
             {
-                auto p_index = p.intensity;
+                const int p_index = static_cast<int>(p.intensity);
+                if (p_index < 0) {
+                    continue;
+                }
                 optimized_keypose = gtsam::Pose3(gtsam::Rot3::Ypr(p.yaw, p.pitch, p.roll), gtsam::Point3(p.x, p.y, p.z));
+                if (p_index >= keyposes.size())
+                {
+                    keyposes.resize(p_index + 1, optimized_keypose);
+                }
                 keyposes[p_index] = optimized_keypose;
                 PointPose3D keypose_point;
                 keypose_point.x = optimized_keypose.translation().x();
                 keypose_point.y = optimized_keypose.translation().y();
                 keypose_point.z = optimized_keypose.translation().z();
                 keypose_point.intensity = p_index;
+                if (p_index >= keyposes_cloud->size())
+                {
+                    keyposes_cloud->resize(p_index + 1);
+                }
                 keyposes_cloud->points[p_index] = keypose_point;
                 updatePath(optimized_keypose);
             }
@@ -1123,6 +1280,11 @@ public:
         {
             if(msg.update_keyposes == true)
             {
+                if (keyposes_cloud->empty()) {
+                    RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s keyposes_cloud is empty, skip submap update.", params.name_.c_str());
+                    return;
+                }
+
                 // get a new target cloud
                 pcl::PointCloud<PointPose3D>::Ptr surroundingKeyPoses(new pcl::PointCloud<PointPose3D>());
                 pcl::PointCloud<PointPose3D>::Ptr surroundingKeyPosesDS(new pcl::PointCloud<PointPose3D>());
@@ -1142,7 +1304,10 @@ public:
                 downSizeFilterSurroundingKeyPoses.filter(*surroundingKeyPosesDS);
                 for (auto& pt : surroundingKeyPosesDS->points)
                 {
-                    kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis);
+                    if (kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis) <= 0 || pointSearchInd.empty())
+                    {
+                        continue;
+                    }
                     pt.intensity = keyposes_cloud->points[pointSearchInd[0]].intensity;
                 }
 
@@ -1179,6 +1344,11 @@ public:
                 }
                 voxel_grid.setInputCloud(nearframe);
                 voxel_grid.filter(*target_cloud);
+
+                if (target_cloud->empty()) {
+                    RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s target cloud empty after voxel filter, skip gicp target update", params.name_.c_str());
+                    return;
+                }
 
                 // rebuild tree
                 auto begin_build_time = chrono::high_resolution_clock::now();
@@ -1229,6 +1399,10 @@ public:
             std::vector<float> pointSearchSqDis;
 
             // extract all the nearby key poses and downsample them
+            if (keyposes_cloud->empty()) {
+                RCLCPP_INFO(rclcpp::get_logger("odometry"), "%s waiting for first keypose from optimizer...", params.name_.c_str());
+                return;
+            }
             kdtreeSurroundingKeyPoses->setInputCloud(keyposes_cloud); // create kd-tree
             kdtreeSurroundingKeyPoses->radiusSearch(keyposes_cloud->back(), (double)params.keyframes_search_radius_, pointSearchInd, pointSearchSqDis);
             for (int i = 0; i < (int)pointSearchInd.size(); ++i)
@@ -1241,7 +1415,10 @@ public:
             downSizeFilterSurroundingKeyPoses.filter(*surroundingKeyPosesDS);
             for (auto& pt : surroundingKeyPosesDS->points)
             {
-                kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis);
+                if (kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis) <= 0 || pointSearchInd.empty())
+                {
+                    continue;
+                }
                 pt.intensity = keyposes_cloud->points[pointSearchInd[0]].intensity;
             }
 
@@ -1279,9 +1456,14 @@ public:
             voxel_grid.setInputCloud(nearframe);
             voxel_grid.filter(*target_cloud);
 
-            gicp.clearTarget();
-            gicp.setInputTarget(target_cloud);
-        }
+                if (target_cloud->empty()) {
+                    RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s target cloud empty after voxel filter, skip gicp target update", params.name_.c_str());
+                } else {
+                    gicp.clearTarget();
+                    gicp.setInputTarget(target_cloud);
+                    gicp_target_ready = true;
+                }
+            }
         auto end_submap_time = chrono::high_resolution_clock::now();
         auto add_duration3 = chrono::duration_cast<chrono::microseconds>(end_submap_time-start_submap_time).count();
         RCLCPP_DEBUG(rclcpp::get_logger("odometry"), "\033[1;34mRobot<%s> source cloud: %d, target cloud: %d in %fms\033[0m", params.name_.c_str(), source_cloud->size(), target_cloud->size(), float(add_duration3)/1e3);
@@ -1312,7 +1494,11 @@ public:
         if (msg.robot0 == params.id_ && msg.robot1 == params.id_)
         {
             LoopClosure lc(msg.robot0, msg.key0, msg.robot1, msg.key1, msg.yaw_diff);
+            std::lock_guard<std::mutex> lock(lock_on_loop_closure);
             loop_closure_candidates.emplace_back(lc); // 本地回环候选 
+            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+                "[LoopRx] intra candidate queued [%d-%d]->[%d-%d], queue=%zu",
+                msg.robot0, msg.key0, msg.robot1, msg.key1, loop_closure_candidates.size());
         }
         else if (int(msg.noise) == 999 && msg.robot0 == params.id_ && msg.key0 < keyframes.size()) // 
         {
@@ -1330,11 +1516,18 @@ public:
             static rclcpp::Serialization<co_lrio::msg::LoopClosure> serializer;
             serializer.serialize_message(loop_closure_msg.get(), &serialized_msg);
             pub_loop_closure->publish(serialized_msg); 
+            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+                "[LoopRx] stage1 req received, sent frame [%d-%d]->[%d-%d]",
+                msg.robot0, msg.key0, msg.robot1, msg.key1);
         }
         else if (int(msg.noise) == 888 && msg.robot1 == params.id_) // 
         {
             LoopClosure lc(msg.robot0, msg.key0, msg.robot1, msg.key1, msg.yaw_diff, msg.frame);
+            std::lock_guard<std::mutex> lock(lock_on_loop_closure);
             loop_closure_candidates.emplace_back(lc);
+            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+                "[LoopRx] inter candidate queued [%d-%d]->[%d-%d], frame_pts=%zu queue=%zu",
+                msg.robot0, msg.key0, msg.robot1, msg.key1, lc.frame ? lc.frame->size() : 0, loop_closure_candidates.size());
         }
     }
 
@@ -1611,11 +1804,40 @@ public:
                 gtsam::Rot3::RzRyRx(init_pose.rotation().roll(), init_pose.rotation().pitch(), init_pose.rotation().yaw() + initial_yaw_),
                 gtsam::Point3(init_pose.translation().x(), init_pose.translation().y(), init_pose.translation().z()));
 
+            if (!lc_candidate.frame || lc_candidate.frame->empty())
+            {
+                RCLCPP_WARN(rclcpp::get_logger("loop_verify_log"), "[LoopClosure] Empty candidate frame for inter-robot closure.");
+                return make_pair(0, lc_result);
+            }
             *scan_cloud = *lc_candidate.frame;
         }
         else
         {
-            loop_pose0 = keyposes[loop_key0];
+            // 同机器人回环：key0 里程计位姿因长距离漂移可能偏差极大，
+            // 改用 key1 的位姿作为 ICP 初始估计（二者在同一物理位置）
+            double initial_yaw_;
+            if (params.descriptor_type_ == DescriptorType::ScanContext)
+            {
+                initial_yaw_ = (init_yaw)*2*M_PI/60.0;
+            }
+            else if (params.descriptor_type_ == DescriptorType::LidarIris)
+            {
+                initial_yaw_ = (init_yaw)*2*M_PI/360.0;
+            }
+            else if (params.descriptor_type_ == DescriptorType::MultiSector)
+            {
+                initial_yaw_ = (init_yaw)*2*M_PI/24.0;
+            }
+            else
+            {
+                initial_yaw_ = 0.0;
+            }
+            if (initial_yaw_ > M_PI) initial_yaw_ -= 2*M_PI;
+
+            auto init_pose = keyposes[loop_key1];
+            loop_pose0 = gtsam::Pose3(
+                gtsam::Rot3::RzRyRx(init_pose.rotation().roll(), init_pose.rotation().pitch(), init_pose.rotation().yaw() + initial_yaw_),
+                gtsam::Point3(init_pose.translation().x(), init_pose.translation().y(), init_pose.translation().z()));
             *scan_cloud = *keyframes[loop_key0];
         }
         // source pointcloud of scan2map matching
@@ -1632,7 +1854,14 @@ public:
         // fail safe check for pointcloud
         if (scan_cloud->size() < 300 || map_cloud->size() < 1000)
         {
-            RCLCPP_WARN(rclcpp::get_logger("loop_verify_log"), "[LoopClosure] keyFrameCloud too little points");
+            RCLCPP_WARN(rclcpp::get_logger("loop_verify_log"), "[LoopClosure] reject: too few raw points scan=%zu map=%zu",
+                scan_cloud->size(), map_cloud->size());
+            return make_pair(0, lc_result);
+        }
+        if (scan_cloud_filtered->empty() || map_cloud_filtered->empty())
+        {
+            RCLCPP_WARN(rclcpp::get_logger("loop_verify_log"), "[LoopClosure] reject: downsampled empty scan=%zu map=%zu",
+                scan_cloud_filtered->size(), map_cloud_filtered->size());
             return make_pair(0, lc_result);
         }
 
@@ -1658,11 +1887,11 @@ public:
         const auto fitness = gicp_loop.getFitnessScore();
         if (gicp_loop.hasConverged() == false || fitness > params.fitness_score_threshold_)
         {
-            RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] GICP failed (%.2f > %.2f). Reject.\033[0m",
-                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, fitness, params.fitness_score_threshold_);
+            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] reject GICP [%c%d][%c%d] converged=%d fitness=%.3f th=%.3f",
+                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, gicp_loop.hasConverged() ? 1 : 0, fitness, params.fitness_score_threshold_);
             return make_pair(0, lc_result);
         }
-        RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] GICP passed (%.2f < %.2f). Add.\033[0m",
+        RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] pass GICP [%c%d][%c%d] fitness=%.3f th=%.3f",
             loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, fitness, params.fitness_score_threshold_);
 
         // ---- overlap 验证（与 LoopClosureDetector / HL_BPR_v2.cpp 保持一致） ----
@@ -1695,11 +1924,11 @@ public:
 
             if (overlap < params.overlap_threshold_)
             {
-                RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] Overlap failed (%.3f < %.3f). Reject.\033[0m",
+                RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] reject overlap [%c%d][%c%d] overlap=%.3f th=%.3f",
                     loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, overlap, params.overlap_threshold_);
                 return make_pair(0, lc_result);
             }
-            RCLCPP_DEBUG(rclcpp::get_logger("loop_log_mini"), "\033[1;33m[LoopClosure] [%c%d][%c%d] Overlap passed (%.3f >= %.3f).\033[0m",
+            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] pass overlap [%c%d][%c%d] overlap=%.3f th=%.3f",
                 loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, overlap, params.overlap_threshold_);
         }
         catch (const std::exception &e)
@@ -1755,11 +1984,20 @@ public:
 
         while (rclcpp::ok())
         {
-            if (!loop_closure_candidates.empty())
+            LoopClosure lc_candidate;
+            bool has_candidate = false;
             {
-                auto lc_candidate = loop_closure_candidates.front();
-                loop_closure_candidates.pop_front();
-                
+                std::lock_guard<std::mutex> lock(lock_on_loop_closure);
+                if (!loop_closure_candidates.empty())
+                {
+                    lc_candidate = loop_closure_candidates.front();
+                    loop_closure_candidates.pop_front();
+                    has_candidate = true;
+                }
+            }
+
+            if (has_candidate)
+            {
                 clock_t start_time, end_time;
                 start_time = this->get_clock()->now().seconds();
                 const auto result = calculateTransformation(lc_candidate);
@@ -1768,11 +2006,17 @@ public:
                 {
                     auto lc = result.second;
                     publish_optimization_request(lc.robot1, lc.symbol0, lc.symbol1, lc.measurement.pose, lc.fitness_score);
-                    RCLCPP_INFO(rclcpp::get_logger("loop_log"), "calculateTransformation with %f s", end_time - start_time);   //在这里考虑回环效率！！！！！！！！！！！！！
+                    RCLCPP_INFO(rclcpp::get_logger("loop_log"), "[LoopVerify] accepted and published in %.3f s", end_time - start_time);   //在这里考虑回环效率！！！！！！！！！！！！！
                 }
                 else if (result.first == -1)
                 {
+                    std::lock_guard<std::mutex> lock(lock_on_loop_closure);
                     loop_closure_candidates.emplace_back(lc_candidate);
+                    RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] postponed candidate due to insufficient history");
+                }
+                else
+                {
+                    RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] candidate rejected");
                 }
             }
 
