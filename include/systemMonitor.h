@@ -76,15 +76,15 @@ public:
             const float bw = (float)msg_byte_size_sum / time_window_f / 1024.0;
             const float rt = (float)runtime_sum / time_window_f;
             const float rtc = (float)std::max(int(runtime_count_sum),1) / time_window_f;
-            if (nth_received >= time_window_i)
-                RCLCPP_INFO(rclcpp::get_logger("monitor"), "(In %ds) KF opt hz: %.2f; rcv bw: %.2f kBps; avg opt time: %.2f ms for %d frames",
-                    time_window_i, hz, bw, rt/rtc, runtime_count_sum);
-            else
-            {
-                nth_received += 1;
-                RCLCPP_WARN(rclcpp::get_logger("monitor"), "(In %ds) KF opt hz: %.2f; rcv bw: %.2f kBps; avg opt time: %.2f ms for %d frames <- [Invalid] Data too small for the window.",
-                    time_window_i, hz, bw, rt/rtc, runtime_count_sum);
-            }
+            // if (nth_received >= time_window_i)
+            //     RCLCPP_INFO(rclcpp::get_logger("monitor"), "(In %ds) KF opt hz: %.2f; rcv bw: %.2f kBps; avg opt time: %.2f ms for %d frames",
+            //         time_window_i, hz, bw, rt/rtc, runtime_count_sum);
+            // else
+            // {
+            //     nth_received += 1;
+            //     RCLCPP_WARN(rclcpp::get_logger("monitor"), "(In %ds) KF opt hz: %.2f; rcv bw: %.2f kBps; avg opt time: %.2f ms for %d frames <- [Invalid] Data too small for the window.",
+            //         time_window_i, hz, bw, rt/rtc, runtime_count_sum);
+            // }
 
             msg_rcv_count_sum -= msg_rcv_count[window_tail];
             msg_byte_size_sum -= msg_byte_size[window_tail];

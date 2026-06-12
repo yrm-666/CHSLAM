@@ -1,6 +1,7 @@
 #include "common.h"
 #include "outlierRejection.h"
 #include "risam/RISAM2.h"
+#include "groundPlaneFactor.h"
 
 namespace co_lrio
 {
@@ -25,13 +26,21 @@ private:
     float gps_cov_threshold_;
     bool use_gps_elevation_;
 
+    // ground plane
+    bool enable_ground_plane_;
+    double ground_plane_z_;
+    int ground_plane_factor_interval_;
+    noiseModel::Diagonal::shared_ptr ground_plane_noise_;
+
     // outlier rejection
     unique_ptr<OutlierRejection> outlier_reject;
 
     // noise model
     noiseModel::Diagonal::shared_ptr prior_noise;
+    noiseModel::Diagonal::shared_ptr anchor_prior_noise_;    // for anchor robot: pins all 6 DOF including yaw
     noiseModel::Diagonal::shared_ptr imu_noise;
-    noiseModel::Diagonal::shared_ptr odometry_noise;
+    noiseModel::Diagonal::shared_ptr odometry_noise;         // flexible — for drifty robots (e.g. Velodyne)
+    noiseModel::Diagonal::shared_ptr anchor_odometry_noise_; // rigid   — for the anchor robot (e.g. Ouster)
     noiseModel::Diagonal::shared_ptr ranging_noise; // uwb
 
     deque<PairwiseDistance> pairwise_distances;
@@ -53,6 +62,7 @@ private:
     boost::shared_ptr<risam::RISAM2> risam_global;
 
     int prior_owner;
+    int8_t anchor_robot_id_;  // smallest ID among manual_prior_pose robots; its trajectory is held rigid
     std::unordered_map<int, gtsam::Pose3> prior_pose;
     std::unordered_map<int, gtsam::Pose3> manual_prior_pose;
 
@@ -92,7 +102,13 @@ public:
         const bool& enable_ranging_outlier_threshold,
         const float& ranging_outlier_threshold,
         const float& gps_cov_threshold,
-        const bool& use_gps_elevation)
+        const bool& use_gps_elevation,
+        const bool& enable_ground_plane,
+        const double& ground_plane_z,
+        const float& ground_plane_noise_z,
+        const float& ground_plane_noise_roll,
+        const float& ground_plane_noise_pitch,
+        const int& ground_plane_factor_interval)
     {
         debug_ = debug;
         enable_risam_ = enable_risam;
@@ -110,6 +126,17 @@ public:
         gps_cov_threshold_ = gps_cov_threshold;
         use_gps_elevation_ = use_gps_elevation;
 
+        enable_ground_plane_ = enable_ground_plane;
+        ground_plane_z_ = ground_plane_z;
+        ground_plane_factor_interval_ = (ground_plane_factor_interval < 1) ? 1 : ground_plane_factor_interval;
+        // OrientedPlane3 error = [tangent_1, tangent_2, d]
+        // tangent components correspond to normal direction (roll/pitch),
+        // d component corresponds to height
+        ground_plane_noise_ = noiseModel::Diagonal::Sigmas(
+            (Vector(3) << (double)ground_plane_noise_roll,
+                          (double)ground_plane_noise_pitch,
+                          (double)ground_plane_noise_z).finished());
+
         // outlier rejection
         outlier_reject = unique_ptr<OutlierRejection>(new OutlierRejection(pcm_threshold, dir));
 
@@ -120,9 +147,18 @@ public:
         //     (Vector(6) << 1e-2f, 1e-2f, 1e-2f, 1e-1f, 1e-1f, 1e-1f).finished());
         imu_noise = noiseModel::Diagonal::Variances(
             (Vector(6) << 1e-1f, 1e-1f, 1e-1f, 1e-1f, 1e-1f, 1e-1f).finished());
+        // flexible odometry noise for drifty robots (e.g. Velodyne 16-line):
+        // allows the optimizer to deform their trajectory to match inter-robot loop closures
         odometry_noise = noiseModel::Diagonal::Variances(
+            (Vector(6) << 1e-3f, 1e-3f, 1e-3f, 1e-2f, 1e-2f, 1e-2f).finished());
+        // rigid odometry noise for the anchor robot (smallest manual_prior_pose ID, e.g. Ouster 128-line):
+        // prevents the optimizer from corrupting the reference trajectory when loop closures are applied
+        anchor_odometry_noise_ = noiseModel::Diagonal::Variances(
             (Vector(6) << 1e-6f, 1e-6f, 1e-6f, 1e-3f, 1e-3f, 1e-3f).finished());
-            // (Vector(6) << 1e-2f, 1e-2f, 1e-2f, 1e-2f, 1e-2f, 1e-2f).finished());
+        // anchor prior pins all 6 DOF (including yaw) so the rigid body cannot be rotated by loop closures
+        anchor_prior_noise_ = noiseModel::Diagonal::Variances(
+            (Vector(6) << 1e-6f, 1e-6f, 1e-6f, 1e-6f, 1e-6f, 1e-6f).finished());
+        anchor_robot_id_ = -1;
         ranging_noise = noiseModel::Diagonal::Sigmas((Vector(1) << 0.1).finished());
 
         graduated_graph = std::make_shared<gtsam::NonlinearFactorGraph>();
@@ -179,6 +215,9 @@ public:
         const gtsam::Pose3& pose)
     {
         manual_prior_pose[robot_id] = pose;
+        // anchor = robot with smallest ID among those with a manual prior
+        if (anchor_robot_id_ < 0 || robot_id < anchor_robot_id_)
+            anchor_robot_id_ = robot_id;
     }
 
     void addRobot( //为新机器人构建因子图等等等 并且更新邻接矩阵
@@ -221,10 +260,10 @@ public:
             adjacency_matrix(all_robots.size()-1, i) = 0.0;
         }
 
-        if (debug_)
-        {
-            RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd robot %d\033[0m", robot_id);
-        }
+        // if (debug_)
+        // {
+        //     RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd robot %d\033[0m", robot_id);
+        // }
     }
 
     void optimize(
@@ -234,6 +273,8 @@ public:
         auto start_time = std::chrono::high_resolution_clock::now();
 
         auto do_optimize = saveFactor(sf, indexes); //将当前帧的因子添加到因子图中，并且判断是否满足优化条件（如是否是里程计、是否有足够的约束等），满足则返回true，不满足则返回false
+
+        auto t_save_end = std::chrono::high_resolution_clock::now();
 
         if (do_optimize)
         {
@@ -263,12 +304,12 @@ public:
 
         auto end_time = std::chrono::high_resolution_clock::now();
 
-        if (debug_)
-        {
-            RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36moptimizer update %c%d with %.2fms.\033[0m",
-                sf.index_to.chr(), sf.index_to.index(), 
-                float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3);
-        }
+        RCLCPP_WARN(rclcpp::get_logger("optimization_log"),
+            "[Timing][Optimizer] %c%d  saveFactor=%.1fms  solve=%.1fms  total=%.1fms",
+            sf.index_to.chr(), sf.index_to.index(),
+            float(std::chrono::duration_cast<std::chrono::microseconds>(t_save_end - start_time).count())/1e3,
+            float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - t_save_end).count())/1e3,
+            float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3);
     }
 
     vector<int8_t> getConnectedRobot()
@@ -402,10 +443,10 @@ private:
 
             connected_robots.emplace_back(maximum_robot);
 
-            if (debug_)
-            {
-                RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd robot %d to global graph.\033[0m", maximum_robot);
-            }
+            // if (debug_)
+            // {
+            //     RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd robot %d to global graph.\033[0m", maximum_robot);
+            // }
         }
     }
 
@@ -433,13 +474,13 @@ private:
         {
             return false;
         }
-        if (debug_)
-        {
-            RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36mAdd distance constraint, %c%d %c%d dis-est_dis: %.2f.\033[0m",
-                pairwise_distance.symbol_current.chr(), pairwise_distance.symbol_current.index(),
-                pairwise_distance.symbol_other.chr(), pairwise_distance.symbol_other.index(),
-                fabs(pairwise_distance.distance - est_dis));
-        }
+        // if (debug_)
+        // {
+        //     RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36mAdd distance constraint, %c%d %c%d dis-est_dis: %.2f.\033[0m",
+        //         pairwise_distance.symbol_current.chr(), pairwise_distance.symbol_current.index(),
+        //         pairwise_distance.symbol_other.chr(), pairwise_distance.symbol_other.index(),
+        //         fabs(pairwise_distance.distance - est_dis));
+        // }
 
         /*  
         *  *   :   robot poses
@@ -474,19 +515,34 @@ private:
         auto pose_between = pose0.between(imu_pose);
         local_graph.at(pairwise_distance.robot_other)->addExpressionFactor(imu_odom_expression, pose_between, imu_noise);
         local_graph_backup.at(pairwise_distance.robot_other)->addExpressionFactor(imu_odom_expression, pose_between, imu_noise);
-        
+        RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+            "[Factor] imu-between %c%d -> %c%d t=[%.2f %.2f %.2f] (uwb bridge)",
+            pairwise_distance.symbol_other.chr(), (int)pairwise_distance.symbol_other.index(),
+            imu_odom_symbol.chr(), (int)imu_odom_symbol.index(),
+            pose_between.translation().x(), pose_between.translation().y(), pose_between.translation().z());
+
         if (enable_risam_)
         {
             auto graduated_factor = risam::make_shared_graduated<gtsam::RangeFactor<gtsam::Pose3>>(
                 boost::make_shared<risam::SIGKernel>(6), imu_odom_symbol, pairwise_distance.symbol_current, pairwise_distance.distance,
                 gtsam::noiseModel::Gaussian::Covariance(ranging_noise->covariance()));
             graduated_graph->push_back(graduated_factor);
+            RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                "[Factor] range(risam) %c%d -- %c%d dis=%.2f est=%.2f err=%.2f",
+                imu_odom_symbol.chr(), (int)imu_odom_symbol.index(),
+                pairwise_distance.symbol_current.chr(), (int)pairwise_distance.symbol_current.index(),
+                pairwise_distance.distance, est_dis, fabs(pairwise_distance.distance - est_dis));
         }
         else
         {
             auto range_factor = RangeFactor<gtsam::Pose3>(imu_odom_symbol, pairwise_distance.symbol_current, pairwise_distance.distance, ranging_noise);
             graph->push_back(range_factor);
             graph_backup->push_back(range_factor);
+            RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                "[Factor] range %c%d -- %c%d dis=%.2f est=%.2f err=%.2f",
+                imu_odom_symbol.chr(), (int)imu_odom_symbol.index(),
+                pairwise_distance.symbol_current.chr(), (int)pairwise_distance.symbol_current.index(),
+                pairwise_distance.distance, est_dis, fabs(pairwise_distance.distance - est_dis));
             // local_graph.at(pairwise_distance.robot_other)->add(range_factor);
             // local_graph_backup.at(pairwise_distance.robot_other)->add(range_factor);
         }
@@ -503,7 +559,7 @@ private:
         // handle distance message
         if (!sf.other_ids.empty() && enable_ranging_)
         {
-            RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mrcv distance data with size: %d\033[0m", sf.other_ids.size());
+            // RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mrcv distance data with size: %d\033[0m", sf.other_ids.size());
 
             // add distance constraint
             std::unordered_map<int, pair<gtsam::Symbol, float>> new_dis_map;
@@ -526,7 +582,7 @@ private:
                 // find pose
                 if (sf.imu_odometry.find(other_id) == sf.imu_odometry.end())
                 {
-                    RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mcan't find imu pose.\033[0m");
+                    // RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mcan't find imu pose.\033[0m");
                     continue;
                 }
                 auto imu_odom = sf.imu_odometry.at(other_id);
@@ -535,7 +591,7 @@ private:
 
                 if (dis_map.find(other_id) == dis_map.end() || dis_map.at(other_id).find(sf.robot_id) == dis_map.at(other_id).end())
                 {
-                    RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mdon't find dis_map!\033[0m");
+                    // RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mdon't find dis_map!\033[0m");
                     continue;
                 }
                 auto symbol_other = gtsam::Symbol(dis_map.at(other_id).at(sf.robot_id).first);
@@ -559,6 +615,12 @@ private:
         const SwarmFrame& sf,
         map<gtsam::Symbol, gtsam::Symbol>& indexes)
     {
+        RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+            "[Factor] ===== frame robot=%d %c%d -> %c%d =====",
+            (int)sf.robot_id,
+            sf.index_from.chr(), (int)sf.index_from.index(),
+            sf.index_to.chr(), (int)sf.index_to.index());
+
         latest_symbol = sf.index_to;
 
         if (sf.index_from.chr() == sf.index_to.chr())  //同机器人 
@@ -588,17 +650,57 @@ private:
                         connected_robots.emplace_back(sf.robot_id);  // 添加到已连接的机器人列表中
                     }
 
-                    auto prior_factor = Pose3_(sf.index_to); // 构造先验因子，测量值为用户指定的位姿，噪声模型为预设的先验噪声模型
-                    local_graph.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise);  // 将先验因子添加到当前机器人的局部因子图中
-                    local_graph_backup.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), prior_noise); // 将先验因子添加到当前机器人的局部因子图备份中
+                    // anchor robot gets a fully-pinned prior (including yaw) so the optimizer
+                    // cannot rotate its trajectory as a rigid body to satisfy loop closures
+                    auto p_noise = (sf.robot_id == anchor_robot_id_) ? anchor_prior_noise_ : prior_noise;
+                    auto prior_factor = Pose3_(sf.index_to);
+                    local_graph.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), p_noise);
+                    local_graph_backup.at(sf.robot_id)->addExpressionFactor(prior_factor, prior_pose.at(sf.robot_id), p_noise);
+                    RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                        "[Factor] prior(manual) %c%d t=[%.2f %.2f %.2f] anchor=%d",
+                        sf.index_to.chr(), (int)sf.index_to.index(),
+                        prior_pose.at(sf.robot_id).translation().x(),
+                        prior_pose.at(sf.robot_id).translation().y(),
+                        prior_pose.at(sf.robot_id).translation().z(),
+                        (sf.robot_id == anchor_robot_id_) ? 1 : 0);
 
-                    if (debug_)
-                    {
-                        RCLCPP_INFO(
-                            rclcpp::get_logger("optimization_log_mini"),
-                            "\033[0;36madd manual prior robot %d to global graph.\033[0m",
-                            sf.robot_id);
-                    }
+                    // if (debug_)
+                    // {
+                    //     RCLCPP_INFO(
+                    //         rclcpp::get_logger("optimization_log_mini"),
+                    //         "\033[0;36madd manual prior robot %d to global graph.\033[0m",
+                    //         sf.robot_id);
+                    // }
+                }
+
+                // ground plane: init plane variable + tight prior + first observation
+                if (enable_ground_plane_)
+                {
+                    auto gp_sym = gtsam::Symbol('G', sf.robot_id);
+                    gtsam::OrientedPlane3 plane_init(gtsam::Unit3(0, 0, 1), ground_plane_z_);
+
+                    local_initial_estimate.at(sf.robot_id)->insert(gp_sym, plane_init);
+                    local_initial_estimate_backup.at(sf.robot_id)->insert(gp_sym, plane_init);
+
+                    // Very tight prior: the ground plane is known a priori
+                    auto plane_prior_noise = noiseModel::Diagonal::Sigmas(
+                        (Vector(3) << 1e-4, 1e-4, 1e-4).finished());
+                    local_graph.at(sf.robot_id)->emplace_shared<PriorFactor<gtsam::OrientedPlane3>>(
+                        gp_sym, plane_init, plane_prior_noise);
+                    local_graph_backup.at(sf.robot_id)->emplace_shared<PriorFactor<gtsam::OrientedPlane3>>(
+                        gp_sym, plane_init, plane_prior_noise);
+
+                    // Observation: ground plane in body frame (body origin on the ground)
+                    // n=[0,0,1], d=0  →  body frame origin lies on the plane at ground_plane_z_
+                    Vector4 z_meas;
+                    z_meas << 0, 0, 1, 0;
+                    auto gp_factor = boost::make_shared<GroundPlaneFactor>(
+                        z_meas, ground_plane_noise_, sf.index_to, gp_sym);
+                    local_graph.at(sf.robot_id)->push_back(gp_factor);
+                    local_graph_backup.at(sf.robot_id)->push_back(gp_factor);
+                    RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                        "[Factor] ground-plane prior+obs G%d <- %c%d",
+                        (int)sf.robot_id, sf.index_to.chr(), (int)sf.index_to.index());
                 }
 
                 #if DEBUG_GPS_CODE
@@ -611,18 +713,45 @@ private:
             // odom factor 相邻帧 
             else if (sf.index_to.index() == sf.index_from.index() + 1)
             {
-                auto pose_between = sf.pose_from.between(sf.pose_to); //相邻帧里程计的位姿变换 
+                auto pose_between = sf.pose_from.between(sf.pose_to); //相邻帧里程计的位姿变换
+
+                // anchor robot gets rigid noise: its trajectory stays fixed so loop-closure
+                // verifications against it remain consistent across optimization cycles
+                bool is_anchor = (anchor_robot_id_ >= 0 && sf.robot_id == anchor_robot_id_);
+                auto odo_noise = is_anchor ? anchor_odometry_noise_ : odometry_noise;
 
                 // odometry expression
-                auto odom_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));  //构造里程计表达式因子，连接当前帧和前一帧，测量值为两帧之间的位姿变换，噪声模型为预设的里程计噪声模型
-                local_graph.at(sf.robot_id)->addExpressionFactor(odom_expression, pose_between, odometry_noise);
-                local_graph_backup.at(sf.robot_id)->addExpressionFactor(odom_expression, pose_between, odometry_noise);
+                auto odom_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));
+                local_graph.at(sf.robot_id)->addExpressionFactor(odom_expression, pose_between, odo_noise);
+                local_graph_backup.at(sf.robot_id)->addExpressionFactor(odom_expression, pose_between, odo_noise);
+                RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                    "[Factor] odom %c%d -> %c%d dt=[%.2f %.2f %.2f] dyaw=%.3f anchor=%d",
+                    sf.index_from.chr(), (int)sf.index_from.index(),
+                    sf.index_to.chr(), (int)sf.index_to.index(),
+                    pose_between.translation().x(), pose_between.translation().y(), pose_between.translation().z(),
+                    pose_between.rotation().yaw(), is_anchor ? 1 : 0);
 
                 // initial estimate
                 local_initial_estimate.at(sf.robot_id)->insert(sf.index_to, sf.pose_to);
                 local_initial_estimate_backup.at(sf.robot_id)->insert(sf.index_to, sf.pose_to);
-                
+
                 addDistanceMeasurement(sf);
+
+                // ground plane observation: only every N keyframes to limit optimization cost
+                if (enable_ground_plane_ &&
+                    (sf.index_to.index() % ground_plane_factor_interval_ == 0))
+                {
+                    auto gp_sym = gtsam::Symbol('G', sf.robot_id);
+                    Vector4 z_meas;
+                    z_meas << 0, 0, 1, 0;
+                    auto gp_factor = boost::make_shared<GroundPlaneFactor>(
+                        z_meas, ground_plane_noise_, sf.index_to, gp_sym);
+                    local_graph.at(sf.robot_id)->push_back(gp_factor);
+                    local_graph_backup.at(sf.robot_id)->push_back(gp_factor);
+                    RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                        "[Factor] ground-plane obs G%d <- %c%d",
+                        (int)sf.robot_id, sf.index_to.chr(), (int)sf.index_to.index());
+                }
 
                 #if DEBUG_GPS_CODE
                 if (sf.gps_valid && abs(sf.gps_odom.pose.covariance[0]) < gps_cov_threshold_ && abs(sf.gps_odom.pose.covariance[7]) < gps_cov_threshold_)
@@ -807,6 +936,12 @@ private:
                 auto loop_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));
                 local_graph.at(sf.robot_id)->addExpressionFactor(loop_expression, pose_between, noise_model);
                 local_graph_backup.at(sf.robot_id)->addExpressionFactor(loop_expression, pose_between, noise_model);
+                RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                    "[Factor] intra-loop %c%d -> %c%d dt=[%.2f %.2f %.2f] dyaw=%.3f noise=%.4f",
+                    sf.index_from.chr(), (int)sf.index_from.index(),
+                    sf.index_to.chr(), (int)sf.index_to.index(),
+                    pose_between.translation().x(), pose_between.translation().y(), pose_between.translation().z(),
+                    pose_between.rotation().yaw(), sf.noise);
 
                 // store loop closure
                 LoopClosure lc(sf.index_from, sf.index_to, sf.noise, Measurement(pose_between, noise_model->covariance()));
@@ -825,20 +960,20 @@ private:
                 indexes.emplace(make_pair(sf.index_from, sf.index_to));
                 indexes.emplace(make_pair(sf.index_to, sf.index_from));
 
-                if (debug_)
-                {
-                    RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd intra-robot loop~ [%c%d][%c%d].\033[0m",
-                        sf.index_from.chr(), sf.index_from.index(), sf.index_to.chr(), sf.index_to.index());
-                }
+                // if (debug_)
+                // {
+                //     RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd intra-robot loop~ [%c%d][%c%d].\033[0m",
+                //         sf.index_from.chr(), sf.index_from.index(), sf.index_to.chr(), sf.index_to.index());
+                // }
             }
         }
         else
         {
             // check history distance
-            if (debug_)
-            {
-                RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mstart to verificate %d distances\033[0m", pairwise_distances.size());
-            }
+            // if (debug_)
+            // {
+            //     RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mstart to verificate %d distances\033[0m", pairwise_distances.size());
+            // }
             for (auto i = 0; i < pairwise_distances.size(); i++)
             {
                 auto pd = pairwise_distances.front();
@@ -900,6 +1035,12 @@ private:
                         boost::make_shared<risam::SIGKernel>(6), sf.index_from, sf.index_to, pose_between,
                         gtsam::noiseModel::Gaussian::Covariance(noise_model->covariance()));
                     graduated_graph->push_back(graduated_factor);
+                    RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                        "[Factor] inter-loop(risam) %c%d -> %c%d dt=[%.2f %.2f %.2f] dyaw=%.3f noise=%.4f",
+                        sf.index_from.chr(), (int)sf.index_from.index(),
+                        sf.index_to.chr(), (int)sf.index_to.index(),
+                        pose_between.translation().x(), pose_between.translation().y(), pose_between.translation().z(),
+                        pose_between.rotation().yaw(), sf.noise);
                 }
                 else
                 {
@@ -907,6 +1048,12 @@ private:
                     auto loop_expression = between(Pose3_(sf.index_from), Pose3_(sf.index_to));
                     graph->addExpressionFactor(loop_expression, pose_between, noise_model);
                     graph_backup->addExpressionFactor(loop_expression, pose_between, noise_model);
+                    RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                        "[Factor] inter-loop %c%d -> %c%d dt=[%.2f %.2f %.2f] dyaw=%.3f noise=%.4f",
+                        sf.index_from.chr(), (int)sf.index_from.index(),
+                        sf.index_to.chr(), (int)sf.index_to.index(),
+                        pose_between.translation().x(), pose_between.translation().y(), pose_between.translation().z(),
+                        pose_between.rotation().yaw(), sf.noise);
                 }
             }
             else
@@ -923,11 +1070,17 @@ private:
                         auto prior_factor = Pose3_(gtsam::Symbol('a' + prior_owner, 0));
                         local_graph.at(prior_owner)->addExpressionFactor(prior_factor, prior_pose.at(prior_owner), prior_noise);
                         local_graph_backup.at(prior_owner)->addExpressionFactor(prior_factor, prior_pose.at(prior_owner), prior_noise);
-                        
-                        if (debug_)
-                        {
-                            RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd prior robot %d to global graph.\033[0m", lc.robot0);
-                        }
+                        RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                            "[Factor] prior(owner) %c0 robot=%d t=[%.2f %.2f %.2f]",
+                            (char)('a' + prior_owner), (int)prior_owner,
+                            prior_pose.at(prior_owner).translation().x(),
+                            prior_pose.at(prior_owner).translation().y(),
+                            prior_pose.at(prior_owner).translation().z());
+
+                        // if (debug_)
+                        // {
+                        //     RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd prior robot %d to global graph.\033[0m", lc.robot0);
+                        // }
                     }
 
                     connected_robots_backup = connected_robots;
@@ -957,20 +1110,34 @@ private:
                             boost::make_shared<risam::SIGKernel>(6), loop.symbol0, loop.symbol1, loop.measurement.pose,
                             gtsam::noiseModel::Gaussian::Covariance(this_noise_model->covariance()));
                         inlier_graph->push_back(graduated_factor);
+                        RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                            "[Factor] inter-loop(replay,risam) %c%d -> %c%d dt=[%.2f %.2f %.2f]",
+                            loop.symbol0.chr(), (int)loop.symbol0.index(),
+                            loop.symbol1.chr(), (int)loop.symbol1.index(),
+                            loop.measurement.pose.translation().x(),
+                            loop.measurement.pose.translation().y(),
+                            loop.measurement.pose.translation().z());
                     }
                     else
                     {
                         graph->addExpressionFactor(this_loop_expression, loop.measurement.pose, this_noise_model);
                         graph_backup->addExpressionFactor(this_loop_expression, loop.measurement.pose, this_noise_model);
+                        RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                            "[Factor] inter-loop(replay) %c%d -> %c%d dt=[%.2f %.2f %.2f]",
+                            loop.symbol0.chr(), (int)loop.symbol0.index(),
+                            loop.symbol1.chr(), (int)loop.symbol1.index(),
+                            loop.measurement.pose.translation().x(),
+                            loop.measurement.pose.translation().y(),
+                            loop.measurement.pose.translation().z());
                     }
                 }
 
                 if (enable_risam_)
                 {
-                    if (debug_)
-                    {
-                        RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mrisam pre update.\033[0m");
-                    }
+                    // if (debug_)
+                    // {
+                    //     RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mrisam pre update.\033[0m");
+                    // }
                     auto known_inlier_factor_num = 0;
                     auto num_special_factors = 0;
                     auto num_normal_factor_num = 0;
@@ -1001,11 +1168,11 @@ private:
                 }
             }
 
-            if (debug_)
-            {
-                RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd inter-robot loop~ [%c%d][%c%d].\033[0m",
-                    sf.index_from.chr(), sf.index_from.index(), sf.index_to.chr(), sf.index_to.index());
-            }
+            // if (debug_)
+            // {
+            //     RCLCPP_INFO(rclcpp::get_logger("optimization_log_mini"), "\033[0;36madd inter-robot loop~ [%c%d][%c%d].\033[0m",
+            //         sf.index_from.chr(), sf.index_from.index(), sf.index_to.chr(), sf.index_to.index());
+            // }
         }
 
         return true;
@@ -1059,9 +1226,13 @@ private:
             global_mea = true;
         }
 
+        auto t_assemble_end = std::chrono::high_resolution_clock::now();
+
         // Set odometry and special factors as known inliers
         FastVector<gtsam::Key> known_inlier_factor_indices(graph_gnc.size());
         std::iota(known_inlier_factor_indices.begin(), known_inlier_factor_indices.begin() + known_inlier_factor_num, 0);
+
+        std::chrono::high_resolution_clock::time_point t_solve_end;
 
         if (!enable_risam_)
         {
@@ -1093,12 +1264,13 @@ private:
                     // Optimize and get weights
                     *keyposes_optimized.at(robot_id) = gnc_optimizer.optimize();
                     gnc_weights = gnc_optimizer.getWeights();
+                    t_solve_end = std::chrono::high_resolution_clock::now();
                 }
                 else if (solver_type_ == SolverType::LevenbergMarquardt)
                 {
                     LevenbergMarquardtParams lmParams_tmp;
                     LevenbergMarquardtParams lmParams = lmParams_tmp.CeresDefaults();
-                    
+
                     GncParams<LevenbergMarquardtParams> gncParams(lmParams);
                     gncParams.setKnownInliers(known_inlier_factor_indices);
 
@@ -1121,6 +1293,7 @@ private:
                     // Optimize and get weights
                     *keyposes_optimized.at(robot_id) = gnc_optimizer.optimize();
                     gnc_weights = gnc_optimizer.getWeights();
+                    t_solve_end = std::chrono::high_resolution_clock::now();
                 }
                 else
                 {
@@ -1132,6 +1305,8 @@ private:
                 for (const auto& key_value : *keyposes_optimized.at(robot_id))
                 {
                     const auto symbol = (gtsam::Symbol)key_value.key;
+                    // Skip non-Pose3 variables (e.g., ground plane 'G')
+                    if (symbol.chr() == 'G') continue;
                     const auto pose = keyposes_optimized.at(robot_id)->at<gtsam::Pose3>(symbol);
                     auto robot = symbol.chr();
                     if (symbol.chr() >= 'a') // not imu pose
@@ -1149,20 +1324,23 @@ private:
                 {
                     if (gnc_weights(i,0) < 0.9)
                     {
-                        graph->erase(factors_it);
+                        factors_it = graph->erase(factors_it);
                         counter++;
                     }
-                    factors_it++;
+                    else
+                    {
+                        ++factors_it;
+                    }
                 }
                 known_inlier_special_factor_num = num_special_factors - (gnc_num - gnc_num_inliers);
                 auto end_time = std::chrono::high_resolution_clock::now();
-                
-                if (debug_)
-                {
-                    RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mGNC optimize took %.2fms. %d loop closures with %d inliers.\033[0m",
-                        float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3,
-                        num_special_factors, known_inlier_special_factor_num);
-                }
+                RCLCPP_WARN(rclcpp::get_logger("optimization_log"),
+                    "[Timing][GNC] assemble=%.1fms  solve=%.1fms  prune=%.1fms  total=%.1fms  loops=%d  inliers=%d  graph_sz=%zu",
+                    float(std::chrono::duration_cast<std::chrono::microseconds>(t_assemble_end - start_time).count())/1e3,
+                    float(std::chrono::duration_cast<std::chrono::microseconds>(t_solve_end - t_assemble_end).count())/1e3,
+                    float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - t_solve_end).count())/1e3,
+                    float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3,
+                    num_special_factors, known_inlier_special_factor_num, graph_gnc.size());
 
                 if (counter == 0)
                 {
@@ -1182,6 +1360,7 @@ private:
                 }
 
                 std::cout << "GNC: " << gnc_weights.cols() << " " << gnc_weights.rows() * gnc_weights.cols() << " GNC throw exception: " << e.what() << std::endl;
+                return false;
             }
         }
         else
@@ -1203,6 +1382,7 @@ private:
                     risam_global->update();
                     risam_global->update();
                     risam_global->update();
+                    auto t_risam_update_end = std::chrono::high_resolution_clock::now();
                     auto output_graph = risam_global->getFactorsUnsafe();
                     auto output_values = risam_global->calculateEstimate();
                     risam_global = boost::make_shared<risam::RISAM2>(riparams);
@@ -1222,17 +1402,19 @@ private:
                     *global_estimate = risam_global->calculateEstimate();
 
                     auto end_time = std::chrono::high_resolution_clock::now();
-                    if (debug_)
-                    {
-                        RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mRISAM global optimize took %.2fms.\033[0m",
-                            float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3);
-                    }
+                    RCLCPP_WARN(rclcpp::get_logger("optimization_log"),
+                        "[Timing][RISAM-Global] assemble=%.1fms  update=%.1fms  extract=%.1fms  total=%.1fms",
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(t_assemble_end - start_time).count())/1e3,
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(t_risam_update_end - t_assemble_end).count())/1e3,
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - t_risam_update_end).count())/1e3,
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3);
                 }
                 else
                 {
                     auto risam_tmp = boost::make_shared<risam::RISAM2>(riparams);
 
                     risam_tmp->update(graph_gnc, values_gnc, true);
+                    auto t_risam_update_end = std::chrono::high_resolution_clock::now();
 
                     graph_gnc.resize(0);
                     values_gnc.clear();
@@ -1240,16 +1422,19 @@ private:
                     *keyposes_optimized.at(robot_id) = risam_tmp->calculateEstimate();
 
                     auto end_time = std::chrono::high_resolution_clock::now();
-                    if (debug_)
-                    {
-                        RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mRISAM local optimize took %.2fms.\033[0m",
-                            float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3);
-                    }
+                    RCLCPP_WARN(rclcpp::get_logger("optimization_log"),
+                        "[Timing][RISAM-Local] assemble=%.1fms  update=%.1fms  extract=%.1fms  total=%.1fms",
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(t_assemble_end - start_time).count())/1e3,
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(t_risam_update_end - t_assemble_end).count())/1e3,
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - t_risam_update_end).count())/1e3,
+                        float(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count())/1e3);
 
                     // save values
                     for (const auto& key_value : *keyposes_optimized.at(robot_id))
                     {
                         auto symbol = (gtsam::Symbol)key_value.key;
+                        // Skip non-Pose3 variables (e.g., ground plane 'G')
+                        if (symbol.chr() == 'G') continue;
                         auto pose = keyposes_optimized.at(robot_id)->at<gtsam::Pose3>(symbol);
                         auto robot = symbol.chr();
                         if (symbol.chr() >= 'a') // not imu pose

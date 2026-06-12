@@ -38,6 +38,15 @@ private:
     std::map<int8_t, gtsam::Pose3> trans_to_pub;
     std::map<int8_t, gtsam::Pose3> trans;
 
+    // loop throttling state (intra / inter tracked independently, per robot):
+    // streak = consecutive loops counted; anchor = pose of the most recent counted
+    // loop; suppressed = category disabled until the robot leaves the anchor by
+    // params.last_loop_dist_ meters
+    std::mutex lock_on_loop_throttle;
+    std::map<int8_t, int> intra_loop_streak, inter_loop_streak;
+    std::map<int8_t, gtsam::Pose3> intra_loop_anchor, inter_loop_anchor;
+    std::map<int8_t, bool> intra_loop_suppressed, inter_loop_suppressed;
+
     /* database */
     std::unique_ptr<MapDatabase> map_database;
     
@@ -149,6 +158,14 @@ public:
         // loop detection setting
         this->declare_parameter("enable_loop", true);
         this->get_parameter("enable_loop", params.enable_loop_);
+        this->declare_parameter("inter_robot_max_distance", 0.0f);
+        this->get_parameter("inter_robot_max_distance", params.inter_robot_max_distance_);
+        this->declare_parameter("loop_closure_max_pose_distance", 50.0f);
+        this->get_parameter("loop_closure_max_pose_distance", params.loop_closure_max_pose_distance_);
+        this->declare_parameter("loop_streak_threshold", 5);
+        this->get_parameter("loop_streak_threshold", params.loop_streak_threshold_);
+        this->declare_parameter("last_loop_dist", 30.0f);
+        this->get_parameter("last_loop_dist", params.last_loop_dist_);
         string descriptor_type;
         this->declare_parameter("descriptor_type", "");
         this->get_parameter("descriptor_type", descriptor_type);
@@ -218,6 +235,20 @@ public:
         this->get_parameter("gps_cov_threshold", params.gps_cov_threshold_);
         this->declare_parameter("use_gps_elevation", false);
         this->get_parameter("use_gps_elevation", params.use_gps_elevation_);
+
+        // ground plane factor
+        this->declare_parameter("enable_ground_plane", false);
+        this->get_parameter("enable_ground_plane", params.enable_ground_plane_);
+        this->declare_parameter("ground_plane_z", 0.0);
+        this->get_parameter("ground_plane_z", params.ground_plane_z_);
+        this->declare_parameter("ground_plane_noise_z", 0.1f);
+        this->get_parameter("ground_plane_noise_z", params.ground_plane_noise_z_);
+        this->declare_parameter("ground_plane_noise_roll", 0.01f);
+        this->get_parameter("ground_plane_noise_roll", params.ground_plane_noise_roll_);
+        this->declare_parameter("ground_plane_noise_pitch", 0.01f);
+        this->get_parameter("ground_plane_noise_pitch", params.ground_plane_noise_pitch_);
+        this->declare_parameter("ground_plane_factor_interval", 20);
+        this->get_parameter("ground_plane_factor_interval", params.ground_plane_factor_interval_);
 
         // cpu setting
         this->declare_parameter("pub_tf_interval", 0.01f);
@@ -314,7 +345,10 @@ public:
             ThresholdType::Cost, 0.8, params.loop_num_threshold_, params.use_pcm_, params.pcm_threshold_,
             params.save_directory_, params.enable_ranging_, params.minimum_ranging_,
             params.enable_ranging_outlier_threshold_, params.ranging_outlier_threshold_,
-            params.gps_cov_threshold_, params.use_gps_elevation_));
+            params.gps_cov_threshold_, params.use_gps_elevation_,
+            params.enable_ground_plane_, params.ground_plane_z_,
+            params.ground_plane_noise_z_, params.ground_plane_noise_roll_,
+            params.ground_plane_noise_pitch_, params.ground_plane_factor_interval_));
 
         auto register_manual_pose = [this](RobustOptimizer* optimizer_ptr, const int8_t robot_id, const std::vector<double>& pose_vec)
         {
@@ -358,7 +392,96 @@ public:
 
     }
 
-    void performInterLoopClosure()  //执行一次回环检测 
+    // owner gate on the verified-loop timeline (optimizationInfoHandler): handles
+    // release + streak reset, driven by the poses of loops that actually passed
+    // verification — these arrive ordered along the trajectory, so the state stays
+    // consistent regardless of verification-queue latency.
+    // returns true while the category is suppressed at query_pose.
+    bool loopThrottled(
+        const bool& is_intra,
+        const int8_t& robot,
+        const gtsam::Pose3& query_pose)
+    {
+        std::lock_guard<std::mutex> lock(lock_on_loop_throttle);
+
+        auto& streak = is_intra ? intra_loop_streak : inter_loop_streak;
+        auto& anchor = is_intra ? intra_loop_anchor : inter_loop_anchor;
+        auto& suppressed = is_intra ? intra_loop_suppressed : inter_loop_suppressed;
+
+        if (!suppressed[robot])
+        {
+            return false;
+        }
+
+        if (anchor[robot].range(query_pose) >= params.last_loop_dist_)
+        {
+            suppressed[robot] = false;
+            streak[robot] = 0;
+            RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                "[LoopThrottle] robot %d %s loops re-enabled (moved %.0fm from anchor)",
+                (int)robot, is_intra ? "intra" : "inter", (double)params.last_loop_dist_);
+            return false;
+        }
+
+        return true;
+    }
+
+    // read-only check used by the detection side (performInterLoopClosure) to
+    // skip sending candidates while their category is suppressed near the anchor.
+    // Deliberately mutates no state — the detection frontier runs ahead of the
+    // verified-loop timeline and must neither release the suppression nor
+    // advance the streak.
+    bool loopSuppressed(
+        const bool& is_intra,
+        const int8_t& robot,
+        const gtsam::Pose3& loop_pose)
+    {
+        std::lock_guard<std::mutex> lock(lock_on_loop_throttle);
+
+        const auto& anchor = is_intra ? intra_loop_anchor : inter_loop_anchor;
+        auto& suppressed = is_intra ? intra_loop_suppressed : inter_loop_suppressed;
+
+        if (!suppressed[robot] || !anchor.count(robot))
+        {
+            return false;
+        }
+
+        return anchor.at(robot).range(loop_pose) < params.last_loop_dist_;
+    }
+
+    // counts an accepted loop of the given category; a spatial gap larger than
+    // last_loop_dist between consecutive loops breaks the streak; reaching
+    // loop_streak_threshold turns the suppression on
+    void countLoop(
+        const bool& is_intra,
+        const int8_t& robot,
+        const gtsam::Pose3& loop_pose)
+    {
+        std::lock_guard<std::mutex> lock(lock_on_loop_throttle);
+
+        auto& streak = is_intra ? intra_loop_streak : inter_loop_streak;
+        auto& anchor = is_intra ? intra_loop_anchor : inter_loop_anchor;
+        auto& suppressed = is_intra ? intra_loop_suppressed : inter_loop_suppressed;
+
+        if (streak[robot] > 0 && anchor[robot].range(loop_pose) > params.last_loop_dist_)
+        {
+            streak[robot] = 0;
+        }
+
+        streak[robot]++;
+        anchor[robot] = loop_pose;
+
+        if (streak[robot] >= params.loop_streak_threshold_)
+        {
+            suppressed[robot] = true;
+            RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                "[LoopThrottle] robot %d %s loops reached %d, suppressed within %.0fm",
+                (int)robot, is_intra ? "intra" : "inter", streak[robot],
+                (double)params.last_loop_dist_);
+        }
+    }
+
+    void performInterLoopClosure()  //执行一次回环检测
     {
         // early return
         if (inter_robot_loop_ptr >= scan_descriptor->getSize())     //越界保护  scan_descriptor->getSize()为描述子的索引大小
@@ -369,21 +492,25 @@ public:
         // periodic status log — every 100 frames print descriptor pool size
         if (inter_robot_loop_ptr % 100 == 0)
         {
-            RCLCPP_INFO(rclcpp::get_logger("loop_log"),
-                "[LoopDetect] ptr=%d  descriptor_pool=%d",
-                inter_robot_loop_ptr, scan_descriptor->getSize());
+            // RCLCPP_INFO(rclcpp::get_logger("loop_log"),
+            //     "[LoopDetect] ptr=%d  descriptor_pool=%d",
+            //     inter_robot_loop_ptr, scan_descriptor->getSize());
         }
 
         // detect inter-robot and intra-robot loop closure
         auto robot_key = scan_descriptor->getIndex(inter_robot_loop_ptr);
+        auto t_detect_s = std::chrono::high_resolution_clock::now();
         auto candidates = scan_descriptor->detectLoopClosure(robot_key.first, robot_key.second);
+        auto ms_detect = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - t_detect_s).count() / 1e3f;
         RCLCPP_DEBUG(rclcpp::get_logger("loop_log"), "performInterLoopClosure %d/%d", inter_robot_loop_ptr, scan_descriptor->getSize());
-        RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
-            "[LoopDetect] query=[%d-%d] candidates=%zu enable_loop=%d",
-            robot_key.first, robot_key.second, candidates.size(), params.enable_loop_ ? 1 : 0);
+        // RCLCPP_WARN(rclcpp::get_logger("loop_log_mini"),
+        //     "[Timing][LoopDetect] query=[%d-%d] candidates=%zu detect=%.1fms enable_loop=%d",
+        //     robot_key.first, robot_key.second, candidates.size(), ms_detect, params.enable_loop_ ? 1 : 0);
+        (void)ms_detect;
         inter_robot_loop_ptr++;
 
-        // no loop closure candidate 
+        // no loop closure candidate
         if (candidates.empty())
         {
             return;
@@ -393,16 +520,70 @@ public:
         {
             if (!params.enable_loop_ && robot_key.first!=get<0>(candidate)) // 如果外回环检测被禁用，并且候选项是异机器人回环，则跳过该候选项
             {
-                RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
-                    "[LoopDetect] skip inter-robot candidate [%d-%d]->[%d-%d], enable_loop=false",
-                    robot_key.first, robot_key.second, get<0>(candidate), get<1>(candidate));
+                // RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+                //     "[LoopDetect] skip inter-robot candidate [%d-%d]->[%d-%d], enable_loop=false",
+                //     robot_key.first, robot_key.second, get<0>(candidate), get<1>(candidate));
                 continue;
             }
-            
+
+            // distance pre-filter for intra-robot candidates: both keys live in the
+            // same robot's (backend-optimized) frame, so reject before the candidate
+            // is ever sent to the front-end queue instead of after GICP dequeues it
+            if (params.loop_closure_max_pose_distance_ > 0.0f && robot_key.first == get<0>(candidate))
+            {
+                const auto p0 = map_database->poseAt(robot_key.first, robot_key.second).translation();
+                const auto p1 = map_database->poseAt(get<0>(candidate), get<1>(candidate)).translation();
+                const double dx = p0.x()-p1.x(), dy = p0.y()-p1.y(), dz = p0.z()-p1.z();
+                const double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+                if (dist > params.loop_closure_max_pose_distance_)
+                {
+                    continue;
+                }
+            }
+
+            // distance pre-filter for inter-robot candidates
+            if (params.inter_robot_max_distance_ > 0.0f && robot_key.first != get<0>(candidate))
+            {
+                const auto r0 = robot_key.first;
+                const auto k0 = robot_key.second;
+                const auto r1 = get<0>(candidate);
+                const auto k1 = get<1>(candidate);
+
+                if (trans_to_pub.count(r0) && trans_to_pub.count(r1))
+                {
+                    const auto p0 = trans_to_pub.at(r0).compose(map_database->poseAt(r0, k0)).translation();
+                    const auto p1 = trans_to_pub.at(r1).compose(map_database->poseAt(r1, k1)).translation();
+                    const double dx = p0.x()-p1.x(), dy = p0.y()-p1.y(), dz = p0.z()-p1.z();
+                    const double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+                    if (dist > params.inter_robot_max_distance_)
+                    {
+                        // RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"),
+                        //     "[LoopFilter] skip inter-robot [%d-%d]->[%d-%d] world_dist=%.1fm > %.0fm",
+                        //     r0, k0, r1, k1, dist, (double)params.inter_robot_max_distance_);
+                        continue;
+                    }
+                }
+            }
+
+            // loop throttling (read-only here): skip candidates of a category that
+            // is currently suppressed near its anchor. All state transitions live
+            // on the verified-loop timeline in optimizationInfoHandler — counting
+            // candidate sends would let failed verifications (e.g. low-overlap
+            // startup candidates) consume the whole streak budget without a single
+            // loop ever entering the graph
+            const bool candidate_is_intra = (robot_key.first == get<0>(candidate));
+            if (loopSuppressed(candidate_is_intra, robot_key.first,
+                    map_database->poseAt(robot_key.first, robot_key.second)))
+            {
+                continue;
+            }
+
             // verify loop closure candidate
             sendLoopClosureStageOne(robot_key.first, robot_key.second, get<0>(candidate), get<1>(candidate), get<2>(candidate));
-            RCLCPP_INFO(rclcpp::get_logger("loop_log"), "\033[1;33mLoop:[%d-%d] [%d-%d] initYaw:%d.\033[0m",
-                robot_key.first, robot_key.second, get<0>(candidate), get<1>(candidate), get<2>(candidate));
+            // RCLCPP_INFO(rclcpp::get_logger("loop_log"), "\033[1;33mLoop:[%d-%d] [%d-%d] initYaw:%d.\033[0m",
+            //     robot_key.first, robot_key.second, get<0>(candidate), get<1>(candidate), get<2>(candidate));
         }
     }
 
@@ -530,7 +711,7 @@ public:
     {
         bool update_flag = find(optimizer->getConnectedRobot().begin(),optimizer->getConnectedRobot().end(),robot_id) != optimizer->getConnectedRobot().end();
         // clear path  
-        //判断这次优化是否涉及到“连通的机器人集合”。如果是，后面会重建这些机器人的 global_path。
+        //判断这次优化是否涉及到"连通的机器人集合"。如果是，后面会重建这些机器人的 global_path。
         if (update_flag)   
         {
             for (const auto& robot : optimizer->getConnectedRobot())
@@ -548,16 +729,18 @@ public:
             }
         }
 
+        auto t_correct_s = std::chrono::high_resolution_clock::now();
+
         // update poses  遍历所有优化后的变量，把位姿写回地图数据库
         pcl::PointCloud<PointPose6D>::Ptr keyposes_to_update(new pcl::PointCloud<PointPose6D>());
         for (const auto& key_value : input_optimized_keyposes)
         {
             auto symbol = (gtsam::Symbol)key_value.key;
-            auto pose = input_optimized_keyposes.at<gtsam::Pose3>(symbol);
-            if (symbol.chr() < 'a') // ignore imu pose
+            if (symbol.chr() < 'a') // ignore imu pose and non-Pose3 variables (e.g. ground plane 'G')
             {
                 continue;
             }
+            auto pose = input_optimized_keyposes.at<gtsam::Pose3>(symbol);
             auto robot = symbol.chr() - 'a';
             auto index = (int)symbol.index();
 
@@ -569,7 +752,7 @@ public:
                 updateGlobalPath(robot, pose);
             }
 
-            //为当前机器人打包一份“优化后关键帧位姿集合（点云形式）”放进响应消息
+            //为当前机器人打包一份"优化后关键帧位姿集合（点云形式）"放进响应消息
             if (robot == robot_id)
             {
                 static PointPose6D p;
@@ -584,7 +767,9 @@ public:
                 keyposes_to_update->push_back(p);  //把优化后的位姿添加到 keyposes_to_update 中，后续会发布给机器人。
             }
         }
-        
+
+        auto t_update_end = std::chrono::high_resolution_clock::now();
+
         // publish path 如果这次优化涉及到连通的机器人集合，则发布它们的 global_path。
         if (update_flag)
         {
@@ -599,6 +784,13 @@ public:
                 }
             }
         }
+
+        auto t_publish_end = std::chrono::high_resolution_clock::now();
+        RCLCPP_WARN(rclcpp::get_logger("optimization_log"),
+            "[Timing][correctPoses] robot=%d  poses=%d  db_update=%.1fms  path_pub=%.1fms",
+            robot_id, (int)input_optimized_keyposes.size(),
+            float(std::chrono::duration_cast<std::chrono::microseconds>(t_update_end - t_correct_s).count())/1e3,
+            float(std::chrono::duration_cast<std::chrono::microseconds>(t_publish_end - t_update_end).count())/1e3);
 
         // buffer  把优化后的位姿封装成 keyposes 消息
         pcl::toROSMsg(*keyposes_to_update, optimization_response_msg.at(robot_id).keyposes);
@@ -621,30 +813,79 @@ public:
         
         system_monitor->addReceviedMsg(serialized_msg->size(), true);
 
-        SwarmFrame sf(msg, imu_odometry_queue, trans_to_pub); // 把优化请求消息、IMU里程计队列和相对变换传给 SwarmFrame，后者会根据这些信息构建出一个“包含当前优化所需全部信息的对象 sf”。
-        
+        auto t0 = chrono::high_resolution_clock::now();
+        SwarmFrame sf(msg, imu_odometry_queue, trans_to_pub); // 把优化请求消息、IMU里程计队列和相对变换传给 SwarmFrame，后者会根据这些信息构建出一个"包含当前优化所需全部信息的对象 sf"。
+        auto t1 = chrono::high_resolution_clock::now();
+
+        // loop throttling: verified loop frames of a suppressed category are dropped
+        // before entering the factor graph; accepted ones update the streak counter.
+        // frame classification mirrors saveFactor: same robot + non-consecutive
+        // indices (excluding the 0/0 prior) = intra loop; different robots = inter loop
+        {
+            const bool same_robot = (sf.index_from.chr() == sf.index_to.chr());
+            const bool is_intra_loop = same_robot
+                && !(sf.index_to.index() == 0 && sf.index_from.index() == 0)
+                && (sf.index_to.index() != sf.index_from.index() + 1);
+            const bool is_inter_loop = !same_robot;
+
+            if (is_intra_loop || is_inter_loop)
+            {
+                const int8_t loop_robot = sf.index_from.chr() - 'a';
+                const auto loop_pose = map_database->poseAt(loop_robot, sf.index_from.index());
+
+                // the throttle state machine lives entirely on this verified-loop
+                // timeline: arrivals are ordered along the trajectory, so counting,
+                // suppression and release stay consistent regardless of how long
+                // the front-end verification queue delays them. Failed verifications
+                // never reach this point and therefore never consume the budget.
+                if (loopThrottled(is_intra_loop, loop_robot, loop_pose))
+                {
+                    RCLCPP_INFO(rclcpp::get_logger("factor_log"),
+                        "[LoopThrottle] drop %s loop %c%d -> %c%d (suppressed)",
+                        is_intra_loop ? "intra" : "inter",
+                        sf.index_from.chr(), (int)sf.index_from.index(),
+                        sf.index_to.chr(), (int)sf.index_to.index());
+                    return;
+                }
+
+                countLoop(is_intra_loop, loop_robot, loop_pose);
+            }
+        }
+
         auto start_optimize_time = chrono::high_resolution_clock::now();
         optimizer->optimize(sf, loop_indexes);
         auto end_optimize_time = chrono::high_resolution_clock::now();
         auto optimize_duration = chrono::duration_cast<chrono::microseconds>(end_optimize_time - start_optimize_time).count();
         system_monitor->addOptimizeTime(float(optimize_duration)/1e3);
+        auto t2 = chrono::high_resolution_clock::now();
 
         if (sf.do_optimize)
         {
-            RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mcorrectPoses\033[0m");
-            correctPoses(robot_id, sf.timestamp, optimizer->getLatestValues(robot_id));  //修正位姿 
+            // RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mcorrectPoses\033[0m");
+            correctPoses(robot_id, sf.timestamp, optimizer->getLatestValues(robot_id));  //修正位姿
         }
+        auto t3 = chrono::high_resolution_clock::now();
 
-        RCLCPP_INFO(rclcpp::get_logger("loop_log"),
-            "[DescSave] robot=%d key=%d isOdom=%d desc_size=%zu pool=%d",
-            (int)sf.robot_id, sf.robot_key, (int)sf.isOdom,
-            sf.descriptor.size(), scan_descriptor->getSize());
+        // RCLCPP_INFO(rclcpp::get_logger("loop_log"),
+        //     "[DescSave] robot=%d key=%d isOdom=%d desc_size=%zu pool=%d",
+        //     (int)sf.robot_id, sf.robot_key, (int)sf.isOdom,
+        //     sf.descriptor.size(), scan_descriptor->getSize());
         if (sf.isOdom)
         {
             // save map and pose
             map_database->savePoseAndMap(sf);
             // make global descriptor
             scan_descriptor->saveDescriptorAndKey(sf.descriptor, sf.robot_id, sf.robot_key);
+            auto t4 = chrono::high_resolution_clock::now();
+            auto ms_swarm  = chrono::duration_cast<chrono::microseconds>(t1 - t0).count() / 1e3f;
+            auto ms_optim  = chrono::duration_cast<chrono::microseconds>(t2 - t1).count() / 1e3f;
+            auto ms_correct= chrono::duration_cast<chrono::microseconds>(t3 - t2).count() / 1e3f;
+            auto ms_save   = chrono::duration_cast<chrono::microseconds>(t4 - t3).count() / 1e3f;
+            auto ms_total  = chrono::duration_cast<chrono::microseconds>(t4 - t0).count() / 1e3f;
+            // RCLCPP_WARN(rclcpp::get_logger("optimization_log"),
+            //     "[Timing] key=%d  swarm=%.1fms  optim=%.1fms  correct=%.1fms  save=%.1fms  TOTAL=%.1fms",
+            //     sf.robot_key, ms_swarm, ms_optim, ms_correct, ms_save, ms_total);
+            (void)ms_swarm; (void)ms_optim; (void)ms_correct; (void)ms_save; (void)ms_total;
             // check distance for loop
             if (!sf.other_ids.empty() && params.enable_loop_ && params.enable_ranging_)
             {
@@ -663,7 +904,7 @@ public:
                     if (pairwise_distance.find(other_id) == pairwise_distance.end() ||
                         pairwise_distance.at(other_id).find(sf.robot_id) == pairwise_distance.at(other_id).end())
                     {
-                        RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mdon't find pairwise_distance!\033[0m");
+                        // RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36mdon't find pairwise_distance!\033[0m");
                         continue;
                     }
 
@@ -686,7 +927,7 @@ public:
             }
             
             // response message
-            RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36m<optimization> publish Response (Key %d) %d\033[0m", sf.robot_id, sf.robot_key);
+            // RCLCPP_INFO(rclcpp::get_logger("optimization_log"), "\033[0;36m<optimization> publish Response (Key %d) %d\033[0m", sf.robot_id, sf.robot_key);
             publishOptimizationResponse(robot_id, sf.index_to, msg, trans.at(robot_id).compose(optimizer->getLatestValue(robot_id)), sf.update_keyposes);
         }
         else
@@ -842,6 +1083,10 @@ public:
         for (const auto& key_value : global_optimized_keyposes_copy)
         {
             auto symbol = (gtsam::Symbol)key_value.key;
+            if (symbol.chr() < 'a') // skip imu pose and non-Pose3 variables (e.g. ground plane 'G')
+            {
+                continue;
+            }
             auto pose = global_optimized_keyposes_copy.at<gtsam::Pose3>(symbol);
             auto index = symbol.index();
             auto robot = symbol.chr() - 'a';
@@ -1024,15 +1269,14 @@ public:
         for (const auto& key_value : latest_values)
         {
             gtsam::Symbol symbol = key_value.key;
-            gtsam::Pose3 pose = latest_values.at<gtsam::Pose3>(symbol);
-            int index = symbol.index();
-            int8_t robot = symbol.chr() - 'a';
-
-            // ignore imu pose
+            // ignore imu pose and non-Pose3 variables (e.g. ground plane 'G')
             if (symbol.chr() >= 0 && symbol.chr() < 'a')
             {
                 continue;
             }
+            gtsam::Pose3 pose = latest_values.at<gtsam::Pose3>(symbol);
+            int index = symbol.index();
+            int8_t robot = symbol.chr() - 'a';
 
             PointPose6D pose_6d;
             pose_6d.x = pose.translation().x();

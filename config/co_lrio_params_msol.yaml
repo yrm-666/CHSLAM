@@ -11,14 +11,14 @@
     # The unset/debug/info/warn/error/fatal log level = 0/10/20/30/40/50
     loop_log_level: 20
     loop_log_mini_level: 10
-    optimization_log_level: 30
+    optimization_log_level: 20
     optimization_log_mini_level: 20
     uwb_log_level: 30
     pcm_log_level: 30
     map_log_mini_level: 30
 
     # frames  坐标系
-    lidar_frame: "/livox"  #"velodyne"
+    lidar_frame: "/ouster"  #"velodyne"
     baselink_frame: "/base_link"
     odometry_frame: "/odom"
     world_frame: "world"
@@ -37,7 +37,15 @@
     use_rtk: false           #是否使用RTK  （高精度GPS）  
     gps_cov_threshold: 0.3      
     use_gps_elevation: true     #是否使用GPS高度信息
-  
+
+    # ground plane constraint
+    enable_ground_plane: true     # 是否启用地面平面因子（适用于地面车辆）
+    ground_plane_z: 0.0             # 期望的地面高度 (m)
+    ground_plane_noise_z: 0.1       # z方向约束噪声标准差 (m)
+    ground_plane_noise_roll: 0.01   # roll约束噪声标准差 (rad, ~0.57°)
+    ground_plane_noise_pitch: 0.01  # pitch约束噪声标准差 (rad, ~0.57°)
+    ground_plane_factor_interval: 50  # 每N帧添加一次地面因子，减少全局优化规模
+
     # feature threshold
     extract_feature: false     #是否提取边缘/平面特征
     edge_threshold: 1.0
@@ -53,34 +61,34 @@
     keyframes_search_radius: 30.0
 
     # odometry gicp setting  GICP核心参数
-    leaf_size: 0.4 #0.4  #降采样
+    leaf_size: 0.8 #0.4  #降采样
     epsilon: 0.005
-    max_iteration_time: 80 #64
-    max_correspondence_distance: 8.0 #5.0 
+    max_iteration_time: 30
+    max_correspondence_distance: 5.0 
     ransac_outlier_reject_threshold: 1.0
     ransac_iterations_time: 5
-
     # loop detection setting
     # descriptor_type: "ScanContext"
     # distance_threshold: 0.25 # 0.45
     # candidates_num: 20
     descriptor_type: "MSOLDescriptor"
     distance_threshold: 0.25 # 0.45
-    candidates_num: 20      
+    candidates_num: 10      
     # descriptor_type: "LidarIris"
     # distance_threshold: 0.35 # 0.5
     # candidates_num: 20
     max_radius: 80.0
-    exclude_recent_num: 50              # 50m 内不检测回环，原 200 过大导致长时间无候选
-    history_keyframe_search_num: 25
-    fitness_score_threshold: 0.4        # Livox 6线稀疏点云适当放宽，原 0.2 过严
+    exclude_recent_num: 200             # 50m 内不检测回环，原 200 过大导致长时间无候选
+    history_keyframe_search_num: 20
+    fitness_score_threshold: 0.4        # GICP 配准后平均点距上限(m)，sqrt(getFitnessScore())；与 loop_closure_detector 尺度一致
     intra_icp_max_correspondence_distance: 5.0   # 初始位姿已用 key1 对齐，只需覆盖小残差
-    intra_icp_iterations_time: 100
-    inter_icp_max_correspondence_distance: 10.0
-    inter_icp_iterations_time: 200
+    intra_icp_iterations_time: 60
+    inter_icp_max_correspondence_distance: 5.0
+    inter_icp_iterations_time: 100
+    inter_icp_max_correction_distance: 5.0     # 跨机器人GICP结果与初始猜测平移差上限(m)，超过即为假阳性
 
     # imu frequency
-    imu_frequency: 200.0   # Livox AVIA IMU 200Hz；若 Velodyne 机器人 IMU 频率不同，在对应 robot namespace 下覆盖
+    imu_frequency: 100.0   # Livox AVIA IMU 200Hz；若 Velodyne 机器人 IMU 频率不同，在对应 robot namespace 下覆盖
     # 默认外参，避免未配置机器人命名空间时构造函数读取空数组崩溃
     extrinsic_l2i: [1.0, 0.0, 0.0, 0.0,
                     0.0, 1.0, 0.0, 0.0,
@@ -88,9 +96,9 @@
                     0.0, 0.0, 0.0, 1.0]
 
     # loop closure overlap verification（回环ICP后的第二道验证）
-    overlap_distance_threshold: 2.0   # 点云重叠计算时的最大对应距离(m)
-    overlap_voxel_size: 0.1           # 重叠计算体素大小(m)
-    overlap_threshold: 0.3            # 室外稀疏点云放宽至 0.3，原 0.5 过严
+    overlap_distance_threshold: 1.0   # 点云重叠计算时的最大对应距离(m)，2.0太松会接受未收敛的GICP
+    overlap_voxel_size: 0.4           # 重叠计算体素大小(m)，0.1在大地图会VoxelGrid溢出
+    overlap_threshold: 0.9            # 室外稀疏点云放宽至0.3，overlap_distance_threshold缩紧后阈值需相应降低
 
     # cpu setting
     number_of_cores: 2
@@ -99,13 +107,22 @@
 co_lrio_concentrated_mapping:   #多机器人地图融合模块
   ros__parameters:
     # loop detection setting           #开启回环
-    enable_loop: true          
+    enable_loop: true
     map_leaf_size: 0.4
-
+    # inter-robot distance pre-filter: skip inter-robot GICP when estimated world-frame
+    # distance between two keyframes exceeds this value (m). 0 = disabled.
+    # 需配合 manual_init_robot_X 设置各机器人出发点偏移，否则仅能过滤里程计坐标系下的距离。
+    inter_robot_max_distance: 50.0
+    # 机内候选距离预筛(入队前)：两关键帧后端位姿距离超过该值(m)直接丢弃候选。0 = 禁用。
+    loop_closure_max_pose_distance: 50.0
+    # 回环节流：同一类回环(机内/机间独立、按机器人分开)连续检测 loop_streak_threshold 次后，
+    # 机器人离开锚点 last_loop_dist 米之前不再检测/加入该类回环；走出后自动恢复并清零计数。
+    loop_streak_threshold: 10
+    last_loop_dist: 80.0
     # pcm configuration           #一致性检测 
-    loop_num_threshold: 1
+    loop_num_threshold: 3
     use_pcm: true
-    pcm_threshold: 1.635 # 0.872, 1.635, 2.204, 3.455, 5.348, 7.840
+    pcm_threshold: 2.204 # 0.872, 1.635, 2.204, 3.455, 5.348, 7.840
 
     # uwb configuration                   #开启UWB测距 没有关掉 
     enable_ranging: false
@@ -117,8 +134,12 @@ co_lrio_concentrated_mapping:   #多机器人地图融合模块
     # manual initial poses for robots in world frame [x, y, z, roll, pitch, yaw]
     # 与 run.launch.py 中 static_transform_publisher 的初始变换对应，无UWB时帮助跨机器人回环初始化
     manual_init_robot_0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    # manual_init_robot_1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 需与 run.launch.py 中的 static_transform 参数对应
-
+    # manual_init_robot_0: [-46.0, -4.3, 0.2, 0.0, 0.0, 0.0]
+    # manual_init_robot_1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    manual_init_robot_1: [-46.0, -4.3, 0.2, 0.0, 0.0, 0.0]  # 需与 run.launch.py 中的 static_transform 参数对应
+    manual_init_robot_2: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 需与 run.launch.py 中的 static_transform 参数对应
+    # manual_init_robot_2: [1.60, -0.35, 0.03, 0.0, 0.0, 0.0]
+    
     # optimization setting
     enable_risam: false
     use_global_near_map: false
@@ -134,51 +155,47 @@ co_lrio_concentrated_mapping:   #多机器人地图融合模块
 #   co_lrio_lidar_odometry:
 #     ros__parameters:
 #       # IMU Settings
-#       imu_topic: "/Carol/imu/data"                 #IMU话题
-#       scan_topic: "/Carol/velodyne_points"        #点云话题
-
+#       lidar_frame: "/velodyne"
+#       imu_topic: "velodyne/imu"                 #IMU话题
+#       scan_topic: "velodyne/points"        #点云话题
+#       sensor: velodyne
+#       n_scan: 16 #128
+#       horizon_scan: 1800 #1024
 #       # IMU noise parameters  IMU噪声参数
-#       imu_acc_noise: 1.1692699862662088e-02
-#       imu_gyr_noise: 1.0216647894856925e-02
-#       imu_acc_bias_noise: 2.0413058951725431e-04
-#       imu_gyr_bias_noise: 8.4514305618965801e-05 
-#       imu_gravity: 9.79172227     #重力加速度，不变
-
-#       # Extrinsics: T_lb (lidar -> imu) ***********
-#       extrinsic_l2i: [0.999555271477470, -0.022144088840141, 0.019972284013500, 0.007784371906518,
-#                       0.021811658159079, 0.999622421673814, 0.016711502850279, -0.204024496061082,
-#                       -0.020334812152698, -0.016268440573027, 0.999660862885093, -0.029045411719168,
-#                       0.0, 0.0, 0.0, 1.0]
-
-# robot_1:
-#   co_lrio_lidar_odometry:
-#     ros__parameters:
-#       # IMU Settings
-#       sensor: velodyne                   
-#       n_scan: 16
-#       horizon_scan: 1800
-#       imu_topic: "velodyne/imu"
-#       scan_topic: "velodyne/points" 
+#       # imu_acc_noise: 1.1692699862662088e-02
+#       # imu_gyr_noise: 1.0216647894856925e-02
+#       # imu_acc_bias_noise: 2.0413058951725431e-04
+#       # imu_gyr_bias_noise: 8.4514305618965801e-05 
+#       # imu_gravity: 9.79172227     #重力加速度，不变
 #       imu_acc_noise: 5.886e-04
 #       imu_gyr_noise: 1.7453e-04
 #       imu_acc_bias_noise: 1.4715e-05 
 #       imu_gyr_bias_noise: 1.6653e-06 
 #       imu_gravity: 9.80511
 
-#       # Extrinsics: T_lb (lidar -> imu)
+#       # Extrinsics: T_lb (lidar -> imu) ***********
+#       # extrinsic_l2i: [0.9997154956, -0.0224514078,  0.0080537048,  0.4143661912,
+#       #                 0.0223448061,  0.9996646148,  0.0130907428,  0.0084054227,
+#       #                 -0.0083449093, -0.0129070599,  0.9998818782, -0.3030830169,
+#       #                 0.0,           0.0,           0.0,           1.0]
 #       extrinsic_l2i: [ 0.9999967126, -0.0009412223,  0.0023851388,  1.3735012202,
 #                       0.0008965769,  0.9998256609,  0.0186505766, -0.0307301514,
 #                       -0.0024022773, -0.0186483768,  0.9998232179, -0.0417949516,
 #                       0.0,           0.0,           0.0,           1.0]
+#       # GICP parameters for Ouster 128-line
+#       leaf_size: 0.4 #0.8
+#       max_iteration_time: 64 #30
+#       max_correspondence_distance: 5.0
 
-
-robot_0:
+robot_2:
   co_lrio_lidar_odometry:
     ros__parameters:
       # IMU Settings
-      sensor: livox
-      n_scan: 6
-      horizon_scan: 1800
+      sensor: livox  
+      n_scan: 128 #6
+      horizon_scan: 1024 #1800
+      lidar_frame: "/livox"
+      # odometry_frame: "/odom"
       imu_topic: "livox/imu"
       scan_topic: "livox/points" 
       imu_acc_noise: 5.886e-04
@@ -192,3 +209,92 @@ robot_0:
                       0.0383766326,  0.9992518783, -0.0047872494,  0.3217161996,
                       0.0016892951,  0.0047258952,  0.9999874060, -0.0728942406,
                       0.0,           0.0,           0.0,           1.0]
+
+      overlap_voxel_size: 0.4
+      leaf_size: 0.4
+      max_iteration_time: 64
+      max_correspondence_distance: 5.0
+
+robot_1:
+  co_lrio_lidar_odometry:
+    ros__parameters:
+      # IMU Settings
+      sensor: velodyne                   
+      n_scan: 16
+      horizon_scan: 1800
+      lidar_frame: "/velodyne"
+      # odometry_frame: "/odom"
+      imu_topic: "velodyne/imu"
+      scan_topic: "velodyne/points" 
+      imu_acc_noise: 5.886e-04
+      imu_gyr_noise: 1.7453e-04
+      imu_acc_bias_noise: 3.000e-05 #1.4715e-05 
+      imu_gyr_bias_noise: 4.000e-06 #1.6653e-06 
+      imu_gravity: 9.80511
+
+      # Extrinsics: T_lb (lidar -> imu)
+      extrinsic_l2i: [ 0.9999967126, -0.0009412223,  0.0023851388,  1.3735012202,
+                      0.0008965769,  0.9998256609,  0.0186505766, -0.0307301514,
+                      -0.0024022773, -0.0186483768,  0.9998232179, -0.0417949516,
+                      0.0,           0.0,           0.0,           1.0]
+      
+      overlap_voxel_size: 0.4
+      leaf_size: 0.4
+      max_iteration_time: 64
+      max_correspondence_distance: 5.0
+
+# robot_0:
+#   co_lrio_lidar_odometry:
+#     ros__parameters:
+#       # IMU Settings
+#       sensor: livox  
+#       n_scan: 128 #6
+#       horizon_scan: 1024 #1800
+#       lidar_frame: "/livox"
+#       # odometry_frame: "/odom"
+#       imu_topic: "livox/imu"
+#       scan_topic: "livox/points" 
+#       imu_acc_noise: 5.886e-04
+#       imu_gyr_noise: 1.7453e-04
+#       imu_acc_bias_noise: 1.4715e-05 
+#       imu_gyr_bias_noise: 1.6653e-06 
+#       imu_gravity: 9.80511
+
+#       # Extrinsics: T_lb (lidar -> imu)
+#       extrinsic_l2i: [ 0.9992619178, -0.0383842364, -0.0015066673, -0.2267518044,
+#                       0.0383766326,  0.9992518783, -0.0047872494,  0.3217161996,
+#                       0.0016892951,  0.0047258952,  0.9999874060, -0.0728942406,
+#                       0.0,           0.0,           0.0,           1.0]
+
+
+#       leaf_size: 0.4
+#       max_iteration_time: 64
+#       max_correspondence_distance: 2.0
+
+robot_0:
+  co_lrio_lidar_odometry:
+    ros__parameters:
+      # IMU Settings
+      sensor: ouster  
+      n_scan: 128 #6
+      horizon_scan: 1024 #1800
+      lidar_frame: "/ouster"
+      # odometry_frame: "/odom"
+      imu_topic: "ouster/imu"
+      scan_topic: "ouster/points" 
+      imu_acc_noise: 5.886e-04
+      imu_gyr_noise: 1.7453e-04
+      imu_acc_bias_noise: 1.4715e-05 
+      imu_gyr_bias_noise: 1.6653e-06 
+      imu_gravity: 9.80511
+
+      # Extrinsics: T_lb (lidar -> imu)
+      extrinsic_l2i: [0.9997154956, -0.0224514078,  0.0080537048,  0.4143661912,
+                      0.0223448061,  0.9996646148,  0.0130907428,  0.0084054227,
+                      -0.0083449093, -0.0129070599,  0.9998818782, -0.3030830169,
+                      0.0,           0.0,           0.0,           1.0]
+      
+      overlap_voxel_size: 0.8
+      leaf_size: 0.8 #0.4
+      max_iteration_time: 50 #64
+      max_correspondence_distance: 5.0 #2.0

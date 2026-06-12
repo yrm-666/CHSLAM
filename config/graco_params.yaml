@@ -37,7 +37,15 @@
     use_rtk: false           #是否使用RTK  （高精度GPS）  
     gps_cov_threshold: 0.3      
     use_gps_elevation: true     #是否使用GPS高度信息
-  
+
+    # ground plane constraint
+    enable_ground_plane: false
+    ground_plane_z: 0.0
+    ground_plane_noise_z: 0.1
+    ground_plane_noise_roll: 0.01
+    ground_plane_noise_pitch: 0.01
+    ground_plane_factor_interval: 20
+
     # feature threshold
     extract_feature: false     #是否提取边缘/平面特征
     edge_threshold: 1.0

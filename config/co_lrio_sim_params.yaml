@@ -53,6 +53,14 @@
     gps_cov_threshold: 0.3
     use_gps_elevation: true
 
+    # ground plane constraint
+    enable_ground_plane: false
+    ground_plane_z: 0.0
+    ground_plane_noise_z: 0.1
+    ground_plane_noise_roll: 0.01
+    ground_plane_noise_pitch: 0.01
+    ground_plane_factor_interval: 20
+
     # feature threshold
     extract_feature: false
     edge_threshold: 1.5

@@ -28,6 +28,21 @@ https://github.com/PengYu-Team/zhongshp/assets/41199568/81985d82-983c-4eca-898b-
   ```
   ros2 launch co_lrio run.launch.py
   ros2 bag play *your-bag-path*
+
+
+  ros2 bag play Avia --remap /livox/points:=/robot_0/livox/points /livox/imu:=/robot_0/livox/imu --rate 0.3
+
+  ros2 bag play Velodyne --remap /velodyne/points:=/robot_1/velodyne/points velodyne/imu:=/robot_1/velodyne/imu --rate 0.3
+
+  ros2 bag play Ouster --remap /ouster/points:=/robot_2/ouster/points ouster/imu:=/robot_2/ouster/imu --rate 0.3
+
+  ros2 service call /save_files co_lrio/srv/SaveFiles "{}"
+
+  source /opt/ros/foxy/setup.bash 
+  source install/setup.bash 
+
+  colcon build --packages-select co_lrio --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  
   ```
   - [our dataset] please also found it in [S3E dataset](https://github.com/DapengFeng/S3E).
 ## Citation

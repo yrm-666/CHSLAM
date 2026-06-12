@@ -300,7 +300,10 @@ struct OdometryParams
     double overlap_distance_threshold_ = 2.0; // meters
     double overlap_voxel_size_ = 0.1;         // downsample voxel for overlap
     double overlap_threshold_ = 0.6;          // required overlap ratio
-    
+
+    // pose distance pre-filter (intra-robot only)
+    float loop_closure_max_pose_distance_ = 50.0f; // skip GICP if odometry distance > this (m)
+
     // cpu setting
     int number_of_cores_;
     float loop_detection_interval_;
@@ -339,6 +342,13 @@ struct ConcentratedMappingParams
     int exclude_recent_num_;
     float map_leaf_size_;
     bool enable_loop_;
+    float inter_robot_max_distance_ = 0.0f; // 0 = disabled; skip inter-robot loop when world-frame distance exceeds this (m)
+    float loop_closure_max_pose_distance_ = 50.0f; // 0 = disabled; drop intra-robot candidate before queueing when pose distance exceeds this (m)
+    // loop throttling: after loop_streak_threshold consecutive loops of one category
+    // (intra / inter, tracked independently per robot), that category is suppressed
+    // until the robot travels last_loop_dist meters away from the streak anchor
+    int loop_streak_threshold_ = 5;
+    float last_loop_dist_ = 30.0f;
 
     // pcm configuration
     int loop_num_threshold_;
@@ -362,6 +372,14 @@ struct ConcentratedMappingParams
     bool use_rtk_;
     float gps_cov_threshold_;
     bool use_gps_elevation_;
+
+    // ground plane factor
+    bool enable_ground_plane_;
+    double ground_plane_z_;
+    float ground_plane_noise_z_;
+    float ground_plane_noise_roll_;
+    float ground_plane_noise_pitch_;
+    int ground_plane_factor_interval_;
 
     // cpu setting
     int parallel_cpu_core_;

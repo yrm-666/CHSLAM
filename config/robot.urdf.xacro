@@ -31,4 +31,11 @@
     <child link="velodyne"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
+
+    <link name="ouster"/>
+  <joint name="ouster_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="ouster"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint> 
 </robot>

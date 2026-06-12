@@ -26,6 +26,9 @@ private:
 
     // fixed lag smoother
     bool system_initialized;
+    // true once initialization() has succeeded at least once; distinguishes a
+    // cold start (anchor at origin) from a mid-run smoother reset (keep pose)
+    bool ever_initialized;
     int frame_index;
     int key_index;
     int last_key_index;
@@ -106,11 +109,14 @@ public:
 
         // noise model
         prior_pose_noise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
-        prior_velocity_noise = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
-        prior_bias_noise = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3); // 1e-2 ~ 1e-3 seems to be good
+        // Tightened from 1e4: robot starts near-stationary; loose prior lets optimizer diverge velocity to absorb IMU error
+        prior_velocity_noise = gtsam::noiseModel::Isotropic::Sigma(3, 1.0); // m/s
+        // Loosened from 1e-3: allow optimizer to find non-zero bias rather than absorbing IMU errors into velocity
+        prior_bias_noise = gtsam::noiseModel::Isotropic::Sigma(6, 1e-1);
 
         // fixed lag smoother
         system_initialized = false;
+        ever_initialized = false;
         frame_index = 0;
         key_index = 0;
         last_key_index = 0;
@@ -523,7 +529,16 @@ public:
         // initialization
         if (!system_initialized)
         {
-            initial_guess = gtsam::Pose3(gtsam::Rot3::Ypr(0, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
+            if (ever_initialized)
+            {
+                // mid-run smoother reset: keep the current pose so odometry
+                // does not jump back to the origin frame
+                initial_guess = pose_in;
+            }
+            else
+            {
+                initial_guess = gtsam::Pose3(gtsam::Rot3::Ypr(0, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
+            }
             last_imu_pose = gtsam::Pose3(gtsam::Rot3::Ypr(imu_yaw, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
 
             return initial_guess;
@@ -882,7 +897,16 @@ public:
                 last_imu_pose = gtsam::Pose3(gtsam::Rot3::Ypr(imu_yaw, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
             }
             #else
-            initial_guess = gtsam::Pose3(gtsam::Rot3::Ypr(0, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
+            if (ever_initialized)
+            {
+                // mid-run smoother reset: keep the current pose so odometry
+                // does not jump back to the origin frame
+                initial_guess = pose_in;
+            }
+            else
+            {
+                initial_guess = gtsam::Pose3(gtsam::Rot3::Ypr(0, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
+            }
             last_imu_pose = gtsam::Pose3(gtsam::Rot3::Ypr(imu_yaw, imu_pitch, imu_roll), gtsam::Point3(0, 0, 0));
             #endif
 
@@ -1005,7 +1029,16 @@ public:
             index_timestamps->emplace(make_pair(gtsam::Symbol('b',frame_index), pose_time));
 
             // optimize
-            smoother->update(*factor_graph, *initial_value, *index_timestamps);
+            try
+            {
+                smoother->update(*factor_graph, *initial_value, *index_timestamps);
+            }
+            catch (const std::exception& e)
+            {
+                RCLCPP_ERROR(rclcpp::get_logger("preintegration"), "\033[1;31m%s GTSAM exception in initialization, resetting: %s\033[0m", params.name_.c_str(), e.what());
+                resetSmoother();
+                return;
+            }
             factor_graph->resize(0);
             initial_value->clear();
             index_timestamps->clear();
@@ -1013,11 +1046,12 @@ public:
             // initilize preintegrator
             imu_preintegrator->resetIntegrationAndSetBias(imu_bias);
             imu_integrator->resetIntegrationAndSetBias(imu_bias);
-            
+
             key_index = frame_index;
             last_key_index = key_index;
             frame_index++;
             system_initialized = true;
+            ever_initialized = true;
         }
         else
         {
@@ -1025,19 +1059,52 @@ public:
         }
     }
 
-    void failSafeCheck()
+    void resetSmoother()
     {
-        // check optimization
+        // Rebuild the smoother from scratch to discard ill-conditioned ISAM2 state.
+        // frame_index intentionally keeps counting so variable keys never collide
+        // with the old smoother's marginalized variables.
+        gtsam::ISAM2Params parameters;
+        smoother = std::make_unique<gtsam::IncrementalFixedLagSmoother>(10.0, parameters);
+        factor_graph->resize(0);
+        initial_value->clear();
+        index_timestamps->clear();
+        factor_indices->clear();
+
+        integrator_time = -1.0;
+        preintegrator_time = -1.0;
+        imu_bias = gtsam::imuBias::ConstantBias();
+        imu_bias_copy = imu_bias;
+
+        // Preserve last known good pose from imu_state_copy; zero velocity so the next
+        // initialization() anchors near the correct position instead of the origin.
+        // imu_state_copy is intentionally NOT overwritten so published odometry does not jump.
+        const auto saved_pose = imu_state_copy.pose();
+        imu_state = std::make_unique<gtsam::NavState>(saved_pose, gtsam::Vector3::Zero());
+
+        imu_integrator->resetIntegrationAndSetBias(imu_bias);
+        imu_preintegrator->resetIntegrationAndSetBias(imu_bias);
+        imu_odom_queue.clear();
+
+        system_initialized = false;
+    }
+
+    // Returns true if IMU state is abnormal; callers should skip repropogateIMU() in that case
+    // so that imu_state_copy (published odometry) stays frozen at the last good value.
+    bool failSafeCheck()
+    {
         const Eigen::Vector3f vel(imu_state->v().x(), imu_state->v().y(), imu_state->v().z());
         const Eigen::Vector3f ba(imu_bias.accelerometer().x(), imu_bias.accelerometer().y(), imu_bias.accelerometer().z());
         const Eigen::Vector3f bg(imu_bias.gyroscope().x(), imu_bias.gyroscope().y(), imu_bias.gyroscope().z());
-        
+
         if (vel.norm() > 30 || ba.norm() > 1.0 || bg.norm() > 1.0)
         {
-            RCLCPP_WARN(rclcpp::get_logger("preintegration"), "\033[1;36m%s Reset imu preintegration!\033[0m", params.name_.c_str());
-            preintegrator_time = -1;
-            system_initialized = false;
+            RCLCPP_WARN(rclcpp::get_logger("preintegration"),
+                "\033[1;36m%s IMU abnormal: vel=%.3f ba=%.3f bg=%.3f, freeze published odometry.\033[0m",
+                params.name_.c_str(), vel.norm(), ba.norm(), bg.norm());
+            return true;
         }
+        return false;
     }
 
     void repropogateIMU()
@@ -1077,62 +1144,127 @@ public:
         const gtsam::PriorFactor<gtsam::Pose3>& factor,
         const double& time)
     {
-        auto values = smoother->calculateEstimate();
-        auto factors = smoother->getFactors();
-
-        const auto pre_pose = values.at<gtsam::Pose3>(gtsam::Symbol('x',key_index));
-        const auto cur_pose = factor.prior();
-        if (pre_pose.range(cur_pose) > 1.0)
+        if (!system_initialized)
         {
-            RCLCPP_DEBUG(rclcpp::get_logger("preintegration"), "\033[1;36mRobot<%s> reset prior pose!\033[0m");
-            for (auto i = int(factors.size()) - 1; i >= 0; --i)
+            return;
+        }
+        try
+        {
+            auto values = smoother->calculateEstimate();
+            auto factors = smoother->getFactors();
+
+            // Guard: skip if key variables are missing (can happen right after reset+reinit)
+            const auto key_x    = gtsam::Symbol('x', key_index);
+            const auto latest_x = gtsam::Symbol('x', frame_index - 1);
+            const auto latest_v = gtsam::Symbol('v', frame_index - 1);
+            const auto latest_b = gtsam::Symbol('b', frame_index - 1);
+            if (!values.exists(key_x) || !values.exists(latest_x) ||
+                !values.exists(latest_v) || !values.exists(latest_b))
             {
-                if (!factors.exists(i))
-                {
-                    continue;
-                }
+                RCLCPP_WARN(rclcpp::get_logger("preintegration"),
+                    "\033[1;33m%s Skip updateKeyOdometry: key not in smoother (key_idx=%d frame_idx=%d)\033[0m",
+                    params.name_.c_str(), key_index, frame_index - 1);
+                factor_graph->resize(0);
+                initial_value->clear();
+                index_timestamps->clear();
+                factor_indices->clear();
+                return;
+            }
 
-                auto this_factor = factors.at(i);
-                if (this_factor->keys().size() != 1)
+            const auto pre_pose = values.at<gtsam::Pose3>(key_x);
+            const auto cur_pose = factor.prior();
+            if (pre_pose.range(cur_pose) > 1.0)
+            {
+                RCLCPP_DEBUG(rclcpp::get_logger("preintegration"), "\033[1;36mRobot<%s> reset prior pose!\033[0m");
+                for (auto i = int(factors.size()) - 1; i >= 0; --i)
                 {
-                    continue;
-                }
+                    if (!factors.exists(i))
+                    {
+                        continue;
+                    }
 
-                factor_indices->emplace_back(i);
+                    auto this_factor = factors.at(i);
+                    if (this_factor->keys().size() != 1)
+                    {
+                        continue;
+                    }
+
+                    // only drop stale pose priors; velocity/bias priors must stay,
+                    // otherwise right after a smoother reset the bias/velocity chain
+                    // loses its only anchor and the system becomes indeterminate
+                    const gtsam::Symbol unary_key(this_factor->keys().front());
+                    if (unary_key.chr() != 'x')
+                    {
+                        continue;
+                    }
+
+                    factor_indices->emplace_back(i);
+                }
+            }
+
+            // add factor
+            factor_graph->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(factor);
+
+            // optimize
+            smoother->update(*factor_graph, *initial_value, *index_timestamps, *factor_indices);
+            smoother->update();
+            smoother->update();
+            smoother->update();
+            smoother->update();
+            factor_graph->resize(0);
+            initial_value->clear();
+            index_timestamps->clear();
+            factor_indices->clear();
+
+            // overwrite the beginning of the preintegration for the next step
+            const auto optmized_result = smoother->calculateEstimate();
+            // Guard: after update, re-check that latest frame vars survived marginalization
+            if (!optmized_result.exists(latest_x) || !optmized_result.exists(latest_v) ||
+                !optmized_result.exists(latest_b))
+            {
+                RCLCPP_WARN(rclcpp::get_logger("preintegration"),
+                    "\033[1;33m%s Skip state update: frame %d marginalized after key update\033[0m",
+                    params.name_.c_str(), frame_index - 1);
+                return;
+            }
+            imu_state = std::make_unique<gtsam::NavState>(optmized_result.at<gtsam::Pose3>(latest_x), optmized_result.at<gtsam::Vector3>(latest_v));
+            imu_bias = optmized_result.at<gtsam::imuBias::ConstantBias>(latest_b);
+
+            // reset the optimization preintegration object
+            imu_integrator->resetIntegrationAndSetBias(imu_bias);
+
+            if (!failSafeCheck())
+            {
+                repropogateIMU();
+            }
+            else
+            {
+                resetSmoother();
             }
         }
-
-        // add factor
-        factor_graph->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(factor);
-
-        // optimize
-        smoother->update(*factor_graph, *initial_value, *index_timestamps, *factor_indices);
-        smoother->update();
-        smoother->update();
-        smoother->update();
-        smoother->update();
-        factor_graph->resize(0);
-        initial_value->clear();
-        index_timestamps->clear();
-        factor_indices->clear();
-
-        // overwrite the beginning of the preintegration for the next step
-        const auto optmized_result = smoother->calculateEstimate();
-        imu_state = std::make_unique<gtsam::NavState>(optmized_result.at<gtsam::Pose3>(gtsam::Symbol('x',frame_index-1)), optmized_result.at<gtsam::Vector3>(gtsam::Symbol('v',frame_index-1)));
-        imu_bias = optmized_result.at<gtsam::imuBias::ConstantBias>(gtsam::Symbol('b',frame_index-1));
-
-        // reset the optimization preintegration object
-        imu_integrator->resetIntegrationAndSetBias(imu_bias);
-
-        failSafeCheck();
-
-        repropogateIMU();
+        catch (const std::exception& e)
+        {
+            // resetSmoother is now pose-continuous (no origin jump), so discard the
+            // ill-conditioned smoother instead of keeping it and failing repeatedly
+            RCLCPP_ERROR(rclcpp::get_logger("preintegration"),
+                "\033[1;31m%s GTSAM exception in updateKeyOdometry, resetting: %s\033[0m",
+                params.name_.c_str(), e.what());
+            resetSmoother();
+        }
     }
 
     void updateOdometry(
         const gtsam::PriorFactor<gtsam::Pose3>& factor,
         const double& time)
     {
+        // If smoother was reset, re-initialize using the current lidar pose before proceeding.
+        if (!system_initialized)
+        {
+            const auto lidar_pose = factor.prior().compose(trans_imu_to_lidar);
+            initialization(lidar_pose, time);
+            return;
+        }
+
         // add imu factor for between factor
         if (imu_mea_queue.empty())
         {
@@ -1193,26 +1325,39 @@ public:
         #endif
         
         // optimize
-        smoother->update(*factor_graph, *initial_value, *index_timestamps);
-        smoother->update();
-        smoother->update();
-        factor_graph->resize(0);
-        initial_value->clear();
-        index_timestamps->clear();
-        factor_indices->clear();
-        
-        // overwrite the beginning of the preintegration for the next step
-        const auto optmized_result = smoother->calculateEstimate();
-        imu_state = std::make_unique<gtsam::NavState>(optmized_result.at<gtsam::Pose3>(gtsam::Symbol('x',frame_index)), optmized_result.at<gtsam::Vector3>(gtsam::Symbol('v',frame_index)));
-        imu_bias = optmized_result.at<gtsam::imuBias::ConstantBias>(gtsam::Symbol('b',frame_index));
-        frame_index++;
+        try
+        {
+            smoother->update(*factor_graph, *initial_value, *index_timestamps);
+            smoother->update();
+            smoother->update();
+            factor_graph->resize(0);
+            initial_value->clear();
+            index_timestamps->clear();
+            factor_indices->clear();
 
-        // reset the optimization preintegration object.
-        imu_integrator->resetIntegrationAndSetBias(imu_bias);
+            // overwrite the beginning of the preintegration for the next step
+            const auto optmized_result = smoother->calculateEstimate();
+            imu_state = std::make_unique<gtsam::NavState>(optmized_result.at<gtsam::Pose3>(gtsam::Symbol('x',frame_index)), optmized_result.at<gtsam::Vector3>(gtsam::Symbol('v',frame_index)));
+            imu_bias = optmized_result.at<gtsam::imuBias::ConstantBias>(gtsam::Symbol('b',frame_index));
+            frame_index++;
 
-        failSafeCheck();
+            // reset the optimization preintegration object.
+            imu_integrator->resetIntegrationAndSetBias(imu_bias);
 
-        repropogateIMU();
+            if (!failSafeCheck())
+            {
+                repropogateIMU();
+            }
+            else
+            {
+                resetSmoother();
+            }
+        }
+        catch (const std::exception& e)
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("preintegration"), "\033[1;31m%s GTSAM exception in updateOdometry, resetting: %s\033[0m", params.name_.c_str(), e.what());
+            resetSmoother();
+        }
     }
 };
 }

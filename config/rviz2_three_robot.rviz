@@ -839,7 +839,7 @@ Visualization Manager:
           Radius: 0.30000001192092896
           Reference Frame: robot_2/base_link
           Value: true
-      Enabled: false
+      Enabled: true
       Name: Robot 2
     - Class: rviz_common/Group
       Displays:

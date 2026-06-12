@@ -2779,7 +2779,7 @@ Visualization Manager:
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Pitch: 1.4247963428497314
-      Target Frame: robot_2/lidar_link
+      Target Frame: robot_2/ouster
       Value: Orbit (rviz_default_plugins)
       Yaw: 6.274331569671631
     Saved: ~

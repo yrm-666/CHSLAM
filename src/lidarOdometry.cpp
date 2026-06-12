@@ -181,7 +181,7 @@ public:
         string sensor_type;
         this->declare_parameter("sensor", "");
         this->get_parameter("sensor", sensor_type);
-        if (sensor_type == "velodyne")
+        if (sensor_type == "velodyne" || sensor_type == "ouster")
         {
             params.sensor_ = LiDARType::VELODYNE;
         }
@@ -191,7 +191,7 @@ public:
         }
         else
         {
-            RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid sensor type (must be either 'velodyne' or 'livox'): %s", sensor_type.c_str());
+            RCLCPP_ERROR(rclcpp::get_logger(""), "Invalid sensor type (must be 'velodyne', 'ouster', or 'livox'): %s", sensor_type.c_str());
             rclcpp::shutdown();
         }
         this->declare_parameter("scan_topic", "velodyne_points");
@@ -352,6 +352,8 @@ public:
         this->get_parameter("inter_icp_max_correspondence_distance", params.inter_icp_max_correspondence_distance_);
         this->declare_parameter("inter_icp_iterations_time", 30);
         this->get_parameter("inter_icp_iterations_time", params.inter_icp_iterations_time_);
+        this->declare_parameter("loop_closure_max_pose_distance", 50.0f);
+        this->get_parameter("loop_closure_max_pose_distance", params.loop_closure_max_pose_distance_);
 
         // overlap verification parameters
         this->declare_parameter("overlap_distance_threshold", 2.0);
@@ -813,7 +815,7 @@ public:
 
             if (!params.only_odom_)
             {
-                sendOptimizationRequest();
+                sendOptimizationRequest(); 
             }
             else
             {
@@ -928,12 +930,10 @@ public:
                 skip_frame++;
                 return;
             }
-            else
-            {
-                skip_frame = 0;
-                noise_model = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-4, 1e-4, 1e-4, 1e-2, 1e-2, 1e-2).finished());
-                current_pose = gtsam::Pose3(gicp.getFinalTransformation().cast<double>());
-            }
+            skip_frame = 0;
+            current_pose = gtsam::Pose3(gicp.getFinalTransformation().cast<double>());
+            noise_model = gtsam::noiseModel::Diagonal::Sigmas(
+                (gtsam::Vector(6) << 1e-4, 1e-4, 1e-4, 1e-2, 1e-2, 1e-2).finished());
 
             // RCLCPP_INFO(rclcpp::get_logger("odometry"), "\033[1;32mRobot<%s> %d current pose: %.2f,%.2f,%.2f.\033[0m", params.name_.c_str(), gicp.hasConverged(), current_pose.translation().x(), current_pose.translation().y(), current_pose.translation().z());
             // optimize
@@ -1198,6 +1198,15 @@ public:
                 msg.pose_to.pose.pose.position.x,
                 msg.pose_to.pose.pose.position.y,
                 msg.pose_to.pose.pose.position.z));
+        const double pose_jump = pre_keypose.range(optimized_keypose);
+        if (!std::isfinite(pose_jump) || pose_jump > 30.0)
+        {
+            RCLCPP_WARN(rclcpp::get_logger("odometry"),
+                "\033[1;33m%s Reject backend pose jump %.3f m (index=%zu), keep current pose.\033[0m",
+                params.name_.c_str(), pose_jump, index);
+            return;
+        }
+
         if (index >= keyposes.size())
         {
             keyposes.resize(index + 1, optimized_keypose);
@@ -1344,11 +1353,6 @@ public:
                 }
                 voxel_grid.setInputCloud(nearframe);
                 voxel_grid.filter(*target_cloud);
-
-                if (target_cloud->empty()) {
-                    RCLCPP_WARN(rclcpp::get_logger("odometry"), "%s target cloud empty after voxel filter, skip gicp target update", params.name_.c_str());
-                    return;
-                }
 
                 // rebuild tree
                 auto begin_build_time = chrono::high_resolution_clock::now();
@@ -1735,36 +1739,42 @@ public:
 //提取近全局地图 输入：回环候选的关键帧id和搜索数量 输出：近全局地图点云 处理内容：根据回环候选的关键帧id提取附近的关键帧，并将这些关键帧的点云进行变换后融合成近全局地图
     pcl::PointCloud<PointPose3D>::Ptr surroundingMap(
         const int& query_key,
-        const int& search_num)
+        const int& search_num,
+        const std::vector<gtsam::Pose3>& kp_snap,
+        const std::vector<pcl::PointCloud<PointPose3D>::Ptr>& kf_snap)
     {
         // extract near keyframes
         pcl::PointCloud<PointPose3D>::Ptr near_keyframes(new pcl::PointCloud<PointPose3D>());
         for (auto i = -search_num; i <= search_num; ++i)
         {
-            const auto key_near = query_key + i;
-            if (key_near >= keyposes.size() || key_near >= keyframes.size() || key_near < 0)
+            const int key_near = query_key + i;
+            if (key_near < 0 || key_near >= static_cast<int>(kp_snap.size()) ||
+                key_near >= static_cast<int>(kf_snap.size()))
             {
                 continue;
             }
 
             // transform pointcloud
-            *near_keyframes += *transformPointCloud(keyframes[key_near], keyposes[key_near]);
+            *near_keyframes += *transformPointCloud(kf_snap[key_near], kp_snap[key_near]);
         }
 
         return near_keyframes;
     }
 
     std::pair<int, LoopClosure> calculateTransformation(
-        const LoopClosure& lc_candidate)
+        const LoopClosure& lc_candidate,
+        const std::vector<gtsam::Pose3>& kp_snap,
+        const std::vector<pcl::PointCloud<PointPose3D>::Ptr>& kf_snap)
     {
-        if (lc_candidate.key1 >= keyposes.size() || lc_candidate.key1 >= keyframes.size())
+        if (lc_candidate.key1 >= static_cast<int>(kp_snap.size()) ||
+            lc_candidate.key1 >= static_cast<int>(kf_snap.size()))
         {
             RCLCPP_ERROR(rclcpp::get_logger("loop_log"), "\033[1;33m[LoopClosure] Index Error. Skip.\033[0m");
             return make_pair(-1, LoopClosure());
         }
 
         // not enough surounding pointcloud
-        if (params.history_keyframe_search_num_ >= keyposes.size())
+        if (params.history_keyframe_search_num_ >= static_cast<int>(kp_snap.size()))
         {
             return make_pair(-1, LoopClosure());
         }
@@ -1776,6 +1786,28 @@ public:
         const auto loop_key1 = lc_candidate.key1;
         const auto init_yaw = lc_candidate.init_yaw;
         LoopClosure lc_result(loop_robot0, loop_key0, loop_robot1, loop_key1, init_yaw);
+
+        // pose distance pre-filter: skip GICP for intra-robot candidates whose odometry
+        // positions are too far apart (large distance = likely not a true loop, and GICP
+        // will fail after max iterations anyway)
+        if (loop_robot0 == loop_robot1)
+        {
+            const auto& t0 = kp_snap[loop_key0].translation();
+            const auto& t1 = kp_snap[loop_key1].translation();
+            const double dx = t0.x() - t1.x();
+            const double dy = t0.y() - t1.y();
+            const double dz = t0.z() - t1.z();
+            const double pose_dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (pose_dist > params.loop_closure_max_pose_distance_)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+                    "[LoopFilter] skip [%c%d]->[%c%d] pose_dist=%.1fm > %.0fm",
+                    static_cast<char>('a' + loop_robot0), loop_key0,
+                    static_cast<char>('a' + loop_robot1), loop_key1,
+                    pose_dist, static_cast<double>(params.loop_closure_max_pose_distance_));
+                return make_pair(0, lc_result);
+            }
+        }
 
         // get initial pose and extract cloud
         static gtsam::Pose3 loop_pose0, loop_pose1;
@@ -1799,7 +1831,7 @@ public:
                 initial_yaw_ -= 2*M_PI;
             }
             
-            auto init_pose = keyposes[loop_key1];
+            auto init_pose = kp_snap[loop_key1];
             loop_pose0 = gtsam::Pose3(  // 以 loop_key1 的位姿为基础，添加初始 yaw 差值，得到 loop_key0 的初始位姿
                 gtsam::Rot3::RzRyRx(init_pose.rotation().roll(), init_pose.rotation().pitch(), init_pose.rotation().yaw() + initial_yaw_),
                 gtsam::Point3(init_pose.translation().x(), init_pose.translation().y(), init_pose.translation().z()));
@@ -1834,22 +1866,25 @@ public:
             }
             if (initial_yaw_ > M_PI) initial_yaw_ -= 2*M_PI;
 
-            auto init_pose = keyposes[loop_key1];
+            auto init_pose = kp_snap[loop_key1];
             loop_pose0 = gtsam::Pose3(
                 gtsam::Rot3::RzRyRx(init_pose.rotation().roll(), init_pose.rotation().pitch(), init_pose.rotation().yaw() + initial_yaw_),
                 gtsam::Point3(init_pose.translation().x(), init_pose.translation().y(), init_pose.translation().z()));
-            *scan_cloud = *keyframes[loop_key0];
+            *scan_cloud = *kf_snap[loop_key0];
         }
+        auto t_lc_s = std::chrono::high_resolution_clock::now();
         // source pointcloud of scan2map matching
         loop_closure_voxelgrid.setInputCloud(scan_cloud);
         pcl::PointCloud<pcl::PointXYZI>::Ptr scan_cloud_filtered(new pcl::PointCloud<pcl::PointXYZI>);
         loop_closure_voxelgrid.filter(*scan_cloud_filtered);
         // target pointcloud of scan2map matching
-        loop_pose1 = keyposes[loop_key1]; 
-        *map_cloud = *surroundingMap(loop_key1, params.history_keyframe_search_num_); // 提取近全局地图
+        loop_pose1 = kp_snap[loop_key1];
+        *map_cloud = *surroundingMap(loop_key1, params.history_keyframe_search_num_, kp_snap, kf_snap); // 提取近全局地图
+        auto t_map_end = std::chrono::high_resolution_clock::now();
         loop_closure_voxelgrid.setInputCloud(map_cloud);
         pcl::PointCloud<pcl::PointXYZI>::Ptr map_cloud_filtered(new pcl::PointCloud<pcl::PointXYZI>);
         loop_closure_voxelgrid.filter(*map_cloud_filtered);
+        auto t_ds_end = std::chrono::high_resolution_clock::now();
 
         // fail safe check for pointcloud
         if (scan_cloud->size() < 300 || map_cloud->size() < 1000)
@@ -1882,76 +1917,87 @@ public:
         gicp_loop.setInputSource(scan_cloud_filtered);
         gicp_loop.setInputTarget(map_cloud_filtered);
         gicp_loop.align(*unused_result, loop_pose0.matrix().cast<float>());
+        auto t_gicp_end = std::chrono::high_resolution_clock::now();
 
-        // check if pass fitness score
-        const auto fitness = gicp_loop.getFitnessScore();
-        if (gicp_loop.hasConverged() == false || fitness > params.fitness_score_threshold_)
+        if (!gicp_loop.hasConverged())
         {
-            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] reject GICP [%c%d][%c%d] converged=%d fitness=%.3f th=%.3f",
-                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, gicp_loop.hasConverged() ? 1 : 0, fitness, params.fitness_score_threshold_);
+            RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+                "[Timing][calcTransform] REJECT no-converge [%c%d]->[%c%d]"
+                "  kf_num=%d  scan_pts=%zu  map_pts=%zu"
+                "  surroundingMap=%.1fms  ds=%.1fms  gicp=%.1fms",
+                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1,
+                params.history_keyframe_search_num_,
+                scan_cloud_filtered->size(), map_cloud_filtered->size(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t_map_end - t_lc_s).count() / 1e3f,
+                std::chrono::duration_cast<std::chrono::microseconds>(t_ds_end - t_map_end).count() / 1e3f,
+                std::chrono::duration_cast<std::chrono::microseconds>(t_gicp_end - t_ds_end).count() / 1e3f);
             return make_pair(0, lc_result);
         }
-        RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] pass GICP [%c%d][%c%d] fitness=%.3f th=%.3f",
-            loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, fitness, params.fitness_score_threshold_);
 
-        // ---- overlap 验证（与 LoopClosureDetector / HL_BPR_v2.cpp 保持一致） ----
-        try {
-            // convert filtered clouds (PointXYZI) -> PointXYZ
-            pcl::PointCloud<pcl::PointXYZ>::Ptr src_xyz(new pcl::PointCloud<pcl::PointXYZ>);
-            pcl::PointCloud<pcl::PointXYZ>::Ptr map_xyz(new pcl::PointCloud<pcl::PointXYZ>);
-            src_xyz->reserve(scan_cloud_filtered->size());
-            map_xyz->reserve(map_cloud_filtered->size());
-            for (const auto &p : scan_cloud_filtered->points)
-            {
-                pcl::PointXYZ q; q.x = p.x; q.y = p.y; q.z = p.z; src_xyz->push_back(q);
-            }
-            for (const auto &p : map_cloud_filtered->points)
-            {
-                pcl::PointXYZ q; q.x = p.x; q.y = p.y; q.z = p.z; map_xyz->push_back(q);
-            }
+        const Eigen::Matrix4f T_gicp = gicp_loop.getFinalTransformation();
 
-            // transform source by final GICP transformation
-            Eigen::Matrix4f T_gicp = gicp_loop.getFinalTransformation();
-            pcl::PointCloud<pcl::PointXYZ>::Ptr src_transformed(new pcl::PointCloud<pcl::PointXYZ>);
-            pcl::transformPointCloud(*src_xyz, *src_transformed, T_gicp);
+        // convert PointXYZI -> PointXYZ for overlap computation (matches loop_closure_detector.hpp)
+        pcl::PointCloud<pcl::PointXYZ>::Ptr src_xyz(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::PointCloud<pcl::PointXYZ>::Ptr map_xyz(new pcl::PointCloud<pcl::PointXYZ>);
+        src_xyz->reserve(scan_cloud_filtered->size());
+        map_xyz->reserve(map_cloud_filtered->size());
+        for (const auto& p : scan_cloud_filtered->points)
+            src_xyz->emplace_back(p.x, p.y, p.z);
+        for (const auto& p : map_cloud_filtered->points)
+            map_xyz->emplace_back(p.x, p.y, p.z);
 
-            // compute overlap score
-            const double overlap = computeOverlapFast(src_transformed, map_xyz,
-                                                     static_cast<float>(params.overlap_distance_threshold_),
-                                                     static_cast<float>(params.overlap_voxel_size_));
-            lc_result.fitness_score = fitness;
-            lc_result.overlap_score = overlap;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr src_transformed(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::transformPointCloud(*src_xyz, *src_transformed, T_gicp);
 
-            if (overlap < params.overlap_threshold_)
-            {
-                RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] reject overlap [%c%d][%c%d] overlap=%.3f th=%.3f",
-                    loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, overlap, params.overlap_threshold_);
-                return make_pair(0, lc_result);
-            }
-            RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] pass overlap [%c%d][%c%d] overlap=%.3f th=%.3f",
-                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1, overlap, params.overlap_threshold_);
-        }
-        catch (const std::exception &e)
+        const double overlap = computeOverlapFast(
+            src_transformed, map_xyz,
+            static_cast<float>(params.overlap_distance_threshold_),
+            static_cast<float>(params.overlap_voxel_size_));
+        auto t_overlap_end = std::chrono::high_resolution_clock::now();
+        lc_result.overlap_score = overlap;
+        lc_result.fitness_score = static_cast<float>(gicp_loop.getFitnessScore());
+
+        auto ms_map_     = std::chrono::duration_cast<std::chrono::microseconds>(t_map_end    - t_lc_s   ).count() / 1e3f;
+        auto ms_ds_      = std::chrono::duration_cast<std::chrono::microseconds>(t_ds_end     - t_map_end).count() / 1e3f;
+        auto ms_gicp_    = std::chrono::duration_cast<std::chrono::microseconds>(t_gicp_end   - t_ds_end ).count() / 1e3f;
+        auto ms_overlap_ = std::chrono::duration_cast<std::chrono::microseconds>(t_overlap_end- t_gicp_end).count() / 1e3f;
+
+        if (overlap < params.overlap_threshold_)
         {
-            RCLCPP_WARN(rclcpp::get_logger("loop_verify_log"), "computeOverlapFast failed: %s", e.what());
+            RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+                "[Timing][calcTransform] REJECT [%c%d]->[%c%d]"
+                "  kf_num=%d  scan_pts=%zu  map_pts=%zu"
+                "  surroundingMap=%.1fms  ds=%.1fms  gicp=%.1fms  overlap=%.1fms  score=%.3f<%.3f",
+                loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1,
+                params.history_keyframe_search_num_,
+                scan_cloud_filtered->size(), map_cloud_filtered->size(),
+                ms_map_, ms_ds_, ms_gicp_, ms_overlap_, overlap, params.overlap_threshold_);
+            return make_pair(0, lc_result);
         }
 
-        // get corrected pose transformation
-        const auto pose_from = gtsam::Pose3(gicp_loop.getFinalTransformation().cast<double>());
-        const auto pose_to = loop_pose1;
+        RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+            "[Timing][calcTransform] ACCEPT [%c%d]->[%c%d]"
+            "  kf_num=%d  scan_pts=%zu  map_pts=%zu"
+            "  surroundingMap=%.1fms  ds=%.1fms  gicp=%.1fms  overlap=%.1fms  score=%.3f  fitness=%.4f",
+            loop_robot0+'a', loop_key0, loop_robot1+'a', loop_key1,
+            params.history_keyframe_search_num_,
+            scan_cloud_filtered->size(), map_cloud_filtered->size(),
+            ms_map_, ms_ds_, ms_gicp_, ms_overlap_, overlap, lc_result.fitness_score);
 
-        // noise model
+        // noise model: variance = 1/overlap (higher overlap → lower variance → tighter constraint)
+        const double noise_var = 1.0 / overlap;
         const auto loop_noise = gtsam::noiseModel::Diagonal::Variances(
-            (gtsam::Vector(6) << 0.2, 0.2, 0.2, 0.2, 0.2, 0.2).finished());
+            (gtsam::Vector(6) << noise_var, noise_var, noise_var, noise_var, noise_var, noise_var).finished());
 
         // loop closure measurement
-        static Measurement measurement;
+        const auto pose_from = gtsam::Pose3(T_gicp.cast<double>());
+        const auto pose_to = loop_pose1;
+        Measurement measurement;
         measurement.pose = pose_from.between(pose_to);
         measurement.covariance = loop_noise->covariance();
         lc_result.measurement = measurement;
-        lc_result.fitness_score = fitness;    //置信度这边考虑要不要优化（比如结合 overlap score，或者利用自适应的置信度）
 
-        return make_pair(1, lc_result);   //这个返回的结果可以再考虑要不要修改
+        return make_pair(1, lc_result);
     }
     
     // 发布回环优化请求到中心处理器 （加入回环因子）
@@ -1998,25 +2044,65 @@ public:
 
             if (has_candidate)
             {
-                clock_t start_time, end_time;
-                start_time = this->get_clock()->now().seconds();
-                const auto result = calculateTransformation(lc_candidate);
-                end_time = this->get_clock()->now().seconds();
+                // Snapshot keyposes/keyframes under lock_on_scan to avoid data race with cloudHandler
+                std::vector<gtsam::Pose3> kp_snap;
+                std::vector<pcl::PointCloud<PointPose3D>::Ptr> kf_snap;
+                {
+                    std::lock_guard<std::mutex> scan_lock(lock_on_scan);
+                    kp_snap = keyposes;
+                    kf_snap = keyframes;
+                }
+
+                auto t_verify_s = std::chrono::high_resolution_clock::now();
+                const auto result = calculateTransformation(lc_candidate, kp_snap, kf_snap);
+                auto ms_verify = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::high_resolution_clock::now() - t_verify_s).count() / 1e3f;
+
                 if (result.first == 1)
                 {
                     auto lc = result.second;
                     publish_optimization_request(lc.robot1, lc.symbol0, lc.symbol1, lc.measurement.pose, lc.fitness_score);
-                    RCLCPP_INFO(rclcpp::get_logger("loop_log"), "[LoopVerify] accepted and published in %.3f s", end_time - start_time);   //在这里考虑回环效率！！！！！！！！！！！！！
+
+                    // Early exit: one candidate passed GICP+overlap, discard remaining
+                    // lower-scored candidates for the same query frame (same robot0+key0)
+                    size_t pruned = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(lock_on_loop_closure);
+                        auto it = loop_closure_candidates.begin();
+                        while (it != loop_closure_candidates.end())
+                        {
+                            if (it->robot0 == lc_candidate.robot0 && it->key0 == lc_candidate.key0)
+                            {
+                                it = loop_closure_candidates.erase(it);
+                                ++pruned;
+                            }
+                            else
+                            {
+                                ++it;
+                            }
+                        }
+                    }
+
+                    RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+                        "[Timing][LoopVerify] ACCEPT [%d-%d]->[%d-%d]  total=%.1fms  queue=%zu  pruned=%zu",
+                        lc_candidate.robot0, lc_candidate.key0, lc_candidate.robot1, lc_candidate.key1,
+                        ms_verify, loop_closure_candidates.size(), pruned);
                 }
                 else if (result.first == -1)
                 {
                     std::lock_guard<std::mutex> lock(lock_on_loop_closure);
                     loop_closure_candidates.emplace_back(lc_candidate);
-                    RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] postponed candidate due to insufficient history");
+                    RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+                        "[Timing][LoopVerify] POSTPONED [%d-%d]->[%d-%d]  total=%.1fms  queue=%zu",
+                        lc_candidate.robot0, lc_candidate.key0, lc_candidate.robot1, lc_candidate.key1,
+                        ms_verify, loop_closure_candidates.size());
                 }
                 else
                 {
-                    RCLCPP_INFO(rclcpp::get_logger("loop_log_mini"), "[LoopVerify] candidate rejected");
+                    RCLCPP_WARN(rclcpp::get_logger("loop_log"),
+                        "[Timing][LoopVerify] REJECT [%d-%d]->[%d-%d]  total=%.1fms  queue=%zu",
+                        lc_candidate.robot0, lc_candidate.key0, lc_candidate.robot1, lc_candidate.key1,
+                        ms_verify, loop_closure_candidates.size());
                 }
             }
 
